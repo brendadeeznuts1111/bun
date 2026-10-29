@@ -35,3 +35,32 @@ export function checkAndReport(scope: string, resource?: string, api?: Permissio
 export function checkPermissions(checks: PermissionCheck[], api?: PermissionAPI): boolean[] {
   return checks.map(({ name, resource }) => checkAndReport(name, resource, api));
 }
+
+/** Extract valid standard error fields without assuming a caught value is an Error. */
+export function normalizePermissionError(value: unknown): Bun.ErrorLike {
+  const error: Bun.ErrorLike = {
+    name: "Error",
+    message: typeof value === "string" ? value : "Non-error value thrown",
+  };
+  if (typeof value !== "object" || value === null) return error;
+
+  try {
+    const name = "name" in value ? value.name : undefined;
+    const message = "message" in value ? value.message : undefined;
+    const stack = "stack" in value ? value.stack : undefined;
+    const code = "code" in value ? value.code : undefined;
+    const errno = "errno" in value ? value.errno : undefined;
+    const syscall = "syscall" in value ? value.syscall : undefined;
+    if (typeof name === "string") error.name = name;
+    if (typeof message === "string") error.message = message;
+    if (typeof stack === "string") error.stack = stack;
+    if (typeof code === "string") error.code = code;
+    if (typeof errno === "number") error.errno = errno;
+    if (typeof syscall === "string") error.syscall = syscall;
+    if ("cause" in value) error.cause = value.cause;
+    return error;
+  } catch {
+    // Accessors and proxies can throw even when the property exists.
+    return { name: "Error", message: "Unable to read thrown error details" };
+  }
+}

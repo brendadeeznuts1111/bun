@@ -4,7 +4,11 @@
  */
 import type { JSC } from "../../../packages/bun-inspector-protocol/src/protocol/jsc";
 import { InspectorSession, connect } from "./junit-reporter.ts";
+import { normalizePermissionError } from "./permission-helper.ts";
 import { SocketFramer } from "./socket-framer.ts";
+
+export type ReporterError = Bun.ErrorLike &
+  Pick<JSC.LifecycleReporter.ErrorEvent, "urls" | "lineColumns" | "sourceLines">;
 
 export interface TestReport {
   id: number;
@@ -13,14 +17,14 @@ export interface TestReport {
   status?: JSC.TestReporter.TestStatus;
   /** Elapsed milliseconds supplied by TestReporter.end. */
   duration?: number;
-  error?: JSC.LifecycleReporter.ErrorEvent;
+  error?: ReporterError;
   stdout: string[];
   stderr: string[];
 }
 
 type ReporterEvent =
   | { event: "Console.messageAdded"; params: JSC.Console.MessageAddedEvent }
-  | { event: "LifecycleReporter.error"; params: JSC.LifecycleReporter.ErrorEvent };
+  | { event: "LifecycleReporter.error"; params: ReporterError };
 
 export type ReporterDiagnostic = {
   reason: "no-active-test" | "overlapping-tests" | "unknown-test";
@@ -92,8 +96,14 @@ export class CustomTestReporter {
   }
 
   private error(params: JSC.LifecycleReporter.ErrorEvent) {
-    const test = this.selectTest({ event: "LifecycleReporter.error", params });
-    if (test) test.error = params;
+    const error: ReporterError = {
+      ...normalizePermissionError(params),
+      urls: params.urls,
+      lineColumns: params.lineColumns,
+      sourceLines: params.sourceLines,
+    };
+    const test = this.selectTest({ event: "LifecycleReporter.error", params: error });
+    if (test) test.error = error;
   }
 
   toJSON(): ReporterOutput {
@@ -106,20 +116,25 @@ export class CustomTestReporter {
 }
 
 if (import.meta.main) {
-  const address = process.argv[2];
-  if (!address) throw new Error("Usage: custom.test.reporter.ts <inspector-address>");
+  try {
+    const address = process.argv[2];
+    if (!address) throw new Error("Usage: custom.test.reporter.ts <inspector-address>");
 
-  const session = new InspectorSession();
-  const disconnected = Promise.withResolvers<void>();
-  const connection = connect(address, disconnected.resolve);
-  process.send?.({ type: "inspector-listening" });
-  const socket = await connection;
-  session.socket = socket;
-  const framer = new SocketFramer(message => session.onMessage(message));
-  session.framer = framer;
-  socket.data = { onData: framer.onData.bind(framer) };
-  const reporter = new CustomTestReporter(session);
-  await disconnected.promise;
-  console.log(reporter.format());
-  process.disconnect?.();
+    const session = new InspectorSession();
+    const disconnected = Promise.withResolvers<void>();
+    const connection = connect(address, disconnected.resolve);
+    process.send?.({ type: "inspector-listening" });
+    const socket = await connection;
+    session.socket = socket;
+    const framer = new SocketFramer(message => session.onMessage(message));
+    session.framer = framer;
+    socket.data = { onData: framer.onData.bind(framer) };
+    const reporter = new CustomTestReporter(session);
+    await disconnected.promise;
+    console.log(reporter.format());
+  } catch (value: unknown) {
+    throw Object.assign(new Error(), normalizePermissionError(value));
+  } finally {
+    process.disconnect?.();
+  }
 }

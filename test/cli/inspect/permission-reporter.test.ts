@@ -1,10 +1,16 @@
 import { expect, test } from "bun:test";
 import { bunEnv, bunExe, tempDir } from "harness";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { JSC } from "../../../packages/bun-inspector-protocol/src/protocol/jsc";
-import { checkAndReport, checkPermissions, formatPermissionResult } from "./permission-helper.ts";
 import { CustomTestReporter } from "./custom.test.reporter.ts";
 import { InspectorSession } from "./junit-reporter.ts";
+import {
+  checkAndReport,
+  checkPermissions,
+  formatPermissionResult,
+  normalizePermissionError,
+} from "./permission-helper.ts";
 import { SocketFramer } from "./socket-framer.ts";
 
 test("permission helper formats and evaluates checks", () => {
@@ -320,4 +326,133 @@ test.each([true, false])("permission helper resets terminal color for allowed=%p
   } finally {
     Object.defineProperty(Bun, "color", descriptor);
   }
+});
+
+test("permission errors preserve valid Bun.ErrorLike metadata", () => {
+  const cause = { reason: "denied" };
+  const original = Object.assign(new Error("read denied", { cause }), {
+    code: "EACCES",
+    errno: -13,
+    syscall: "open",
+  });
+  const result = normalizePermissionError(original);
+  expect(result).toEqual({
+    name: "Error",
+    message: "read denied",
+    stack: original.stack,
+    code: "EACCES",
+    errno: -13,
+    syscall: "open",
+    cause,
+  });
+  expect(result).not.toBe(original);
+  expect(normalizePermissionError(new TypeError("native denied"))).toMatchObject({
+    name: "TypeError",
+    message: "native denied",
+  });
+});
+
+test("permission errors narrow malformed fields and arbitrary thrown values", () => {
+  expect(normalizePermissionError("denied")).toEqual({ name: "Error", message: "denied" });
+  for (const value of [null, undefined, 42, false, Symbol("denied")]) {
+    expect(normalizePermissionError(value)).toEqual({ name: "Error", message: "Non-error value thrown" });
+  }
+  expect(
+    normalizePermissionError({ name: "Error", message: "denied", stack: 42, code: 13, errno: "EACCES", syscall: null }),
+  ).toEqual({ name: "Error", message: "denied" });
+  expect(
+    normalizePermissionError({
+      get message() {
+        throw new Error("getter failed");
+      },
+    }),
+  ).toEqual({ name: "Error", message: "Unable to read thrown error details" });
+  let reads = 0;
+  expect(
+    normalizePermissionError({
+      get code() {
+        return ++reads === 1 ? "EACCES" : 13;
+      },
+    }),
+  ).toEqual({ name: "Error", message: "Non-error value thrown", code: "EACCES" });
+  expect(reads).toBe(1);
+  expect(
+    normalizePermissionError(
+      new Proxy(
+        {},
+        {
+          has() {
+            throw new Error("proxy failed");
+          },
+        },
+      ),
+    ),
+  ).toEqual({ name: "Error", message: "Unable to read thrown error details" });
+});
+
+test("reporter retains optional error metadata and Inspector locations", () => {
+  const session = new FakeSession();
+  const reporter = new CustomTestReporter(session);
+  const error = {
+    ...lifecycleError,
+    code: "EACCES",
+    errno: -13,
+    syscall: "open",
+    cause: { reason: "denied" },
+    stack: "Error: Permission denied",
+  } satisfies Bun.ErrorLike & JSC.LifecycleReporter.ErrorEvent;
+  session.emit("TestReporter.found", { id: 1, line: 1 });
+  session.emit("TestReporter.start", { id: 1 });
+  session.emit("LifecycleReporter.error", error);
+  session.emit("TestReporter.end", { id: 1, status: "fail", elapsed: 1 });
+  session.emit("LifecycleReporter.error", error);
+  expect(reporter.toJSON().tests[0].error).toEqual(error);
+  expect(reporter.toJSON().diagnostics).toEqual([
+    { event: "LifecycleReporter.error", params: error, reason: "no-active-test", activeTestIds: [] },
+  ]);
+  expect(JSON.parse(reporter.format())).toEqual(reporter.toJSON());
+});
+
+test.concurrent("standalone reporter narrows startup errors and exits unsuccessfully", async () => {
+  await using child = Bun.spawn([bunExe(), join(import.meta.dir, "custom.test.reporter.ts")], {
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([child.stdout.text(), child.stderr.text(), child.exited]);
+  expect(stdout).toBe("");
+  expect(stderr).toContain("Usage: custom.test.reporter.ts <inspector-address>");
+  expect(stderr).toContain("error: Usage:");
+  expect(exitCode).toBe(1);
+});
+
+test("permission error normalization preserves native filesystem error fields", () => {
+  using directory = tempDir("permission-error-details", {});
+  let failure: unknown;
+  try {
+    readFileSync(join(String(directory), "missing.txt"));
+  } catch (value: unknown) {
+    failure = value;
+  }
+  const error = normalizePermissionError(failure);
+  expect(error.name).toBe("Error");
+  expect(error.code).toBe("ENOENT");
+  expect(typeof error.errno).toBe("number");
+  expect(error.syscall).toBe("open");
+  expect(error.message).toContain("missing.txt");
+  expect(typeof error.stack).toBe("string");
+});
+
+test.concurrent("standalone reporter preserves a native connection startup error", async () => {
+  using directory = tempDir("rpt", {});
+  const address = "unix://" + join(String(directory), "m", "s");
+  await using child = Bun.spawn([bunExe(), join(import.meta.dir, "custom.test.reporter.ts"), address], {
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([child.stdout.text(), child.stderr.text(), child.exited]);
+  expect(stdout).toBe("");
+  expect(stderr).toContain("ENOENT");
+  expect(exitCode).toBe(1);
 });
