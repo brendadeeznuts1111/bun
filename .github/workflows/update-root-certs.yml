@@ -26,10 +26,8 @@ jobs:
         id: generate-certs
         run: |
           cd packages/bun-usockets/
-          OUTPUT=$(bun generate-root-certs.mjs -v)
-          echo "cert_output<<EOF" >> $GITHUB_ENV
-          echo "$OUTPUT" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
+          certificate_output=$(bun generate-root-certs.mjs -v)
+          printf 'cert_output<<EOF\n%s\nEOF\n' "$certificate_output" >> "$GITHUB_ENV"
 
       - name: Check for changes and stage files
         id: check-changes
@@ -39,24 +37,14 @@ jobs:
             git config --global user.name "github-actions[bot]"
             git config --global user.email "github-actions[bot]@users.noreply.github.com"
             
-            # Get list of modified files and add them
-            git status --porcelain | while read -r status file; do
-              # Remove leading status and whitespace
-              file=$(echo "$file" | sed 's/^.* //')
-              echo "Adding changed file: $file"
-              git add "$file"
-            done
-            
-            echo "changes=true" >> $GITHUB_OUTPUT
-            
-            # Store the list of changed files
-            CHANGED_FILES=$(git status --porcelain)
-            echo "changed_files<<EOF" >> $GITHUB_ENV
-            echo "$CHANGED_FILES" >> $GITHUB_ENV
-            echo "EOF" >> $GITHUB_ENV
+            git add --all
+            printf 'changes=true\n' >> "$GITHUB_OUTPUT"
+
+            changed_files=$(git status --porcelain)
+            printf 'changed_files<<EOF\n%s\nEOF\n' "$changed_files" >> "$GITHUB_ENV"
           else
             echo "No changes detected"
-            echo "changes=false" >> $GITHUB_OUTPUT
+            printf 'changes=false\n' >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create Pull Request
