@@ -3,17 +3,14 @@ description: An internal version of the 'oven-sh/setup-bun' action.
 
 inputs:
   bun-version:
-    type: string
     description: "The version of bun to install: 'latest', 'canary', 'bun-v1.2.0', etc."
     default: latest
     required: false
   baseline:
-    type: boolean
     description: "Whether to use the baseline version of bun."
     default: false
     required: false
   download-url:
-    type: string
     description: "The base URL to download bun from."
     default: "https://pub-5e11e972747a44bf9aaf9394f185a982.r2.dev/releases"
     required: false
