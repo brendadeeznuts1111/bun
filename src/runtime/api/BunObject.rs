@@ -2187,6 +2187,9 @@ pub mod environment_variables {
     ) -> bool {
         let vm = global_object.bun_vm();
         let name_slice = name.to_utf8();
+        if !crate::node::process::permission_allowed(b"env", name_slice.slice()) {
+            return false;
+        }
         let Some(val) = vm.env_loader().get(name_slice.slice()) else {
             return false;
         };
@@ -2212,6 +2215,13 @@ pub mod environment_variables {
     ) {
         let vm = global_object.bun_vm().as_mut();
         let name_slice = name.to_utf8();
+
+        // Permission checks are deliberately performed before mutating the
+        // native environment. The experimental gate is a no-op by default,
+        // preserving existing Bun behavior until explicitly enabled.
+        if !crate::node::process::permission_allowed(b"env", name_slice.slice()) {
+            return;
+        }
 
         // Synchronize the slot swap + env.map.put against a concurrently
         // spawning worker's cloneFrom + env.map.cloneWithAllocator. Without
@@ -2257,6 +2267,9 @@ pub mod environment_variables {
         // SAFETY: bun_vm() returns the live thread-local VM.
         let vm = global_object.bun_vm();
         let sliced = name.to_slice();
+        if !crate::node::process::permission_allowed(b"env", sliced.slice()) {
+            return None;
+        }
         let value = vm.env_loader().get(sliced.slice())?;
         Some(ZigString::init_utf8(value))
     }

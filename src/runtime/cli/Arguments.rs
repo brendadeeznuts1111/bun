@@ -260,6 +260,12 @@ pub(crate) const RUNTIME_PARAMS_: &[ParamType] = &[
     parse_param!(
         "--experimental-http3-fetch        Honor Alt-Svc: h3 in fetch() and upgrade to HTTP/3. Same as BUN_FEATURE_FLAG_EXPERIMENTAL_HTTP3_CLIENT=1"
     ),
+    parse_param!("--experimental-permissions        Enable Bun's experimental permission model"),
+    parse_param!("--secure                          Deny permissions by default (experimental)"),
+    parse_param!("--allow-read <STR>...              Allow filesystem reads (experimental)"),
+    parse_param!("--allow-write <STR>...             Allow filesystem writes (experimental)"),
+    parse_param!("--allow-net <STR>...               Allow network access (experimental)"),
+    parse_param!("--allow-env <STR>...               Allow environment variables (experimental)"),
     parse_param!(
         "--max-http-header-size <INT>      Set the maximum size of HTTP headers in bytes. Default is 16KiB"
     ),
@@ -1090,6 +1096,30 @@ pub fn parse(cmd: CommandTag, ctx: Context<'_>) -> Result<api::TransformOptions,
         ctx.runtime_options.preconnect = slice_to_owned(args.options(b"--fetch-preconnect"));
         ctx.runtime_options.experimental_http2_fetch = args.flag(b"--experimental-http2-fetch");
         ctx.runtime_options.experimental_http3_fetch = args.flag(b"--experimental-http3-fetch");
+        ctx.runtime_options.experimental_permissions = args.flag(b"--experimental-permissions");
+        ctx.runtime_options.secure_permissions = args.flag(b"--secure");
+        ctx.runtime_options.allow_read = slice_to_owned(args.options(b"--allow-read"));
+        ctx.runtime_options.allow_write = slice_to_owned(args.options(b"--allow-write"));
+        ctx.runtime_options.allow_net = slice_to_owned(args.options(b"--allow-net"));
+        ctx.runtime_options.allow_env = slice_to_owned(args.options(b"--allow-env"));
+
+        let has_permission_options = ctx.runtime_options.secure_permissions
+            || !ctx.runtime_options.allow_read.is_empty()
+            || !ctx.runtime_options.allow_write.is_empty()
+            || !ctx.runtime_options.allow_net.is_empty()
+            || !ctx.runtime_options.allow_env.is_empty();
+        if has_permission_options && !ctx.runtime_options.experimental_permissions {
+            Output::err_generic("Permission flags require --experimental-permissions", ());
+            Global::exit(1);
+        }
+
+        if !ctx.runtime_options.allow_read.is_empty() || !ctx.runtime_options.allow_write.is_empty()
+        {
+            Output::err_generic(
+                "⚠️ Warning: filesystem permissions are experimental and partial; Node fs path operations are gated, while Bun.file/symlink canonicalization remain planned",
+                (),
+            );
+        }
         ctx.runtime_options.expose_gc = args.flag(b"--expose-gc");
 
         if let Some(depth_str) = args.option(b"--console-depth") {

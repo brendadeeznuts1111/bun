@@ -53,6 +53,7 @@ use std::io::Write as _;
 use crate::webcore::jsc::{
     self as jsc, CallFrame, JSGlobalObject, JSPromise, JSValue, JsResult, VirtualMachine,
 };
+use bstr::BStr;
 use bun_core::{String as BunString, Tag as BunStringTag, ZigStringSlice};
 use bun_http::{self as http, FetchRedirect, Headers, HeadersExt as _, MimeType};
 use bun_http_jsc::method_jsc;
@@ -608,6 +609,18 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
     };
     let mut url_proxy_buffer = owned_url.into_href().into_vec();
     let mut url = parse_url_detached!(&url_proxy_buffer[..]);
+    if !url.hostname.is_empty() && !crate::node::process::permission_allowed(b"net", url.hostname) {
+        let err = ctx.to_type_error(
+            jsc::ErrorCode::INVALID_ARG_VALUE,
+            format_args!("Network permission denied: {}", BStr::new(url.hostname)),
+        );
+        return Ok(
+            JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
+                global_this,
+                err,
+            ),
+        );
+    }
     if url.is_file() {
         url_type = URLType::File;
     } else if url.is_blob() {
@@ -906,6 +919,18 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
 
         break 'extract_redirect_type redirect_type;
     };
+
+    // Redirect hops are handled below the fetch entry point. Until each hop
+    // can be checked, restrictive network grants must not follow redirects.
+    if bun_options_types::context::try_get().is_some_and(|ctx| {
+        let options = &ctx.runtime_options;
+        options.experimental_permissions
+            && (options.secure_permissions || !options.allow_net.is_empty())
+            && !options.allow_net.iter().any(|entry| entry.as_ref() == b"*")
+    }) && redirect_type == FetchRedirect::Follow
+    {
+        redirect_type = FetchRedirect::Error;
+    }
 
     if global_this.has_exception() {
         return Ok(JSValue::ZERO);

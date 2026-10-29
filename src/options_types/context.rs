@@ -539,6 +539,14 @@ pub struct RuntimeOptions {
     pub preconnect: Vec<Box<[u8]>>,
     pub experimental_http2_fetch: bool,
     pub experimental_http3_fetch: bool,
+    /// Opt-in gate for the in-progress permission model. Without this flag,
+    /// permission CLI options are rejected to preserve Bun's default behavior.
+    pub experimental_permissions: bool,
+    pub secure_permissions: bool,
+    pub allow_read: Vec<Box<[u8]>>,
+    pub allow_write: Vec<Box<[u8]>>,
+    pub allow_net: Vec<Box<[u8]>>,
+    pub allow_env: Vec<Box<[u8]>>,
     pub dns_result_order: Box<[u8]>,
     /// `--expose-gc` makes `globalThis.gc()` available. Added for Node
     /// compatibility.
@@ -603,6 +611,12 @@ impl Default for RuntimeOptions {
             preconnect: Vec::new(),
             experimental_http2_fetch: false,
             experimental_http3_fetch: false,
+            experimental_permissions: false,
+            secure_permissions: false,
+            allow_read: Vec::new(),
+            allow_write: Vec::new(),
+            allow_net: Vec::new(),
+            allow_env: Vec::new(),
             dns_result_order: Box::from(&b"verbatim"[..]),
             expose_gc: false,
             preserve_symlinks_main: false,

@@ -313,7 +313,7 @@ export async function expectMaxObjectTypeCount(
 // we must ensure that finalizers are run
 // so that the reference-counting logic is exercised
 export function gcTick(trace = false) {
-  trace && console.trace("");
+  if (trace) console.trace("");
   // console.trace("hello");
   gc();
   return Bun.sleep(0);
@@ -658,7 +658,10 @@ if (expect.extend)
         }
       }
     },
-    toRun(cmds: string[], optionalStdout?: string, expectedCode: number = 0) {
+    toRun(cmds: unknown, optionalStdout?: string, expectedCode: number = 0) {
+      if (!Array.isArray(cmds) || !cmds.every((cmd: unknown) => typeof cmd === "string")) {
+        throw new TypeError("toRun expects an array of command arguments");
+      }
       const result = Bun.spawnSync({
         cmd: [bunExe(), ...cmds],
         env: bunEnv,
@@ -685,7 +688,10 @@ if (expect.extend)
         message: () => `Expected ${cmds.join(" ")} to fail`,
       };
     },
-    toThrowWithCode(fn: CallableFunction, cls: CallableFunction, code: string) {
+    toThrowWithCode(fn: unknown, cls: CallableFunction, code: string) {
+      if (typeof fn !== "function") {
+        throw new TypeError("toThrowWithCode expects a function");
+      }
       try {
         fn();
         return {
@@ -697,7 +703,7 @@ if (expect.extend)
         if (!(e instanceof cls)) {
           return {
             pass: false,
-            message: () => `Expected error to be instanceof ${cls.name}; got ${e.__proto__.constructor.name}`,
+            message: () => `Expected error to be instanceof ${cls.name}; got ${Bun.inspect(e)}`,
           };
         }
 
@@ -722,7 +728,10 @@ if (expect.extend)
         };
       }
     },
-    async toThrowWithCodeAsync(fn: CallableFunction, cls: CallableFunction, code: string) {
+    async toThrowWithCodeAsync(fn: unknown, cls: CallableFunction, code: string) {
+      if (typeof fn !== "function") {
+        throw new TypeError("toThrowWithCodeAsync expects a function");
+      }
       try {
         await fn();
         return {
@@ -734,7 +743,7 @@ if (expect.extend)
         if (!(e instanceof cls)) {
           return {
             pass: false,
-            message: () => `Expected error to be instanceof ${cls.name}; got ${e.__proto__.constructor.name}`,
+            message: () => `Expected error to be instanceof ${cls.name}; got ${Bun.inspect(e)}`,
           };
         }
 
@@ -1146,7 +1155,7 @@ export async function describeWithContainer(
   // isDockerEnabled() may throw when docker is required but absent, so the
   // env-override and coordinator checks must short-circuit before it.
   if (!process.env["BUN_TEST_SERVICE_" + actualService] && !process.env.BUN_DOCKER_COORDINATOR && !isDockerEnabled()) {
-    describe.todo(label);
+    describe.todo(label, () => {});
     return;
   }
 
@@ -1216,11 +1225,12 @@ class WriteBlockedError extends Error {
 function failTestsOnBlockingWriteCall() {
   const prop = Object.getOwnPropertyDescriptor(child_process.ChildProcess.prototype, "stdin");
   const didAttachSymbol = Symbol("kDidAttach");
-  if (prop) {
+  const getStdin = prop?.get;
+  if (getStdin) {
     Object.defineProperty(child_process.ChildProcess.prototype, "stdin", {
       ...prop,
       get() {
-        const actual = prop.get.call(this);
+        const actual = getStdin.call(this);
         if (actual?.write && !actual.__proto__[didAttachSymbol]) {
           actual.__proto__[didAttachSymbol] = true;
           attachWriteMeasurement(actual);
@@ -1899,11 +1909,14 @@ export class VerdaccioRegistry {
     });
 
     if (response.ok) {
-      const data = await response.json();
+      const data: unknown = await response.json();
+      if (typeof data !== "object" || data === null || !("token" in data) || typeof data.token !== "string") {
+        throw new Error("Failed to create user: response is missing a token");
+      }
       return data.token;
     }
 
-    throw new Error("Failed to create user:", response.statusText);
+    throw new Error(`Failed to create user: ${response.statusText}`);
   }
 
   async authBunfig(user: string) {

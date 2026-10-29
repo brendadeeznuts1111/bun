@@ -1,0 +1,14 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "composite": false,
+    "incremental": false,
+    "types": ["../../packages/bun-types"]
+  },
+  "include": [
+    "permissions.test.ts",
+    "inspect/permission-reporter.test.ts",
+    "../js/bun/test/expect-extend-preload.test.ts"
+  ],
+  "exclude": []
+}

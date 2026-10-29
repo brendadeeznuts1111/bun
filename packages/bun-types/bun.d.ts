@@ -4785,6 +4785,11 @@ declare module "bun" {
   const main: string;
 
   /**
+   * The current working directory of the Bun process.
+   */
+  const cwd: string;
+
+  /**
    * Manually trigger the garbage collector
    *
    * This does two things:

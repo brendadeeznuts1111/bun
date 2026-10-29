@@ -374,6 +374,36 @@ fn with_path_like(err: sys::Error, p: &PathOrFileDescriptor) -> sys::Error {
     }
 }
 
+/// Gate path-based filesystem operations when the experimental permission
+/// model is enabled. File-descriptor operations are already authorized by the
+/// caller that opened the descriptor and therefore bypass path checks.
+#[inline]
+fn check_path_permission(scope: &[u8], path: &[u8], syscall: sys::Tag) -> Maybe<()> {
+    if crate::node::process::permission_allowed(scope, path) {
+        Ok(())
+    } else {
+        Err(sys::Error::from_code(E::EACCES, syscall).with_path(path))
+    }
+}
+
+fn check_open_permission(path: &[u8], flags: i32) -> Maybe<()> {
+    let access_mode = flags & (sys::O::WRONLY | sys::O::RDWR);
+    // O_RDONLY is zero on POSIX, so infer reads from the absence of an
+    // exclusively write-only access mode. Creation/truncation also needs
+    // write authorization even when a platform represents the access
+    // mode as read-only.
+    let reads = access_mode != sys::O::WRONLY;
+    let writes = access_mode != sys::O::RDONLY
+        || flags & (sys::O::CREAT | sys::O::TRUNC | sys::O::APPEND) != 0;
+    if reads {
+        check_path_permission(b"fs.read", path, sys::Tag::open)?;
+    }
+    if writes {
+        check_path_permission(b"fs.write", path, sys::Tag::open)?;
+    }
+    Ok(())
+}
+
 /// `node::Encoding` → `bun_core::NodeEncoding`. Both are `#[repr(u8)]` with the
 /// identical discriminant layout (`Utf8..Buffer`); `webcore::encoding` was ported
 /// against the upstream copy, so adapt at the boundary instead of changing
@@ -4832,6 +4862,7 @@ impl NodeFS {
                 Ok(())
             }
             PathOrFileDescriptor::Path(path_) => {
+                check_path_permission(b"fs.write", path_.slice(), sys::Tag::open)?;
                 let path = path_.slice_z(&mut self.sync_error_buf);
                 let fd = Syscall::open(path, FileSystemFlags::A.as_int(), args.mode)?;
                 let _close = scopeguard::guard(fd, |fd| fd.close());
@@ -5019,6 +5050,8 @@ impl NodeFS {
     }
 
     pub fn copy_file(&mut self, args: &args::CopyFile, _: Flavor) -> Maybe<ret::CopyFile> {
+        check_path_permission(b"fs.read", args.src.slice(), sys::Tag::open)?;
+        check_path_permission(b"fs.write", args.dest.slice(), sys::Tag::open)?;
         match self.copy_file_inner(args) {
             Ok(_) => Ok(()),
             Err(err) => Err(sys::Error {
@@ -6090,6 +6123,8 @@ impl NodeFS {
     }
 
     pub fn open(&mut self, args: &args::Open, _: Flavor) -> Maybe<ret::Open> {
+        let path_bytes = args.path.slice();
+        check_open_permission(path_bytes, args.flags.as_int())?;
         let path = if cfg!(windows) && args.path.slice() == b"/dev/null" {
             // SAFETY: literal is NUL-terminated; len excludes the sentinel.
             ZStr::from_static(b"\\\\.\\NUL\0")
@@ -7045,6 +7080,10 @@ impl NodeFS {
         flavor: Flavor,
         string_type: ReadFileStringType,
     ) -> Maybe<ret::ReadFileWithOptions> {
+        if let PathOrFileDescriptor::Path(path) = &args.path {
+            check_path_permission(b"fs.read", path.slice(), sys::Tag::open)?;
+            check_open_permission(path.slice(), args.flag.as_int())?;
+        }
         let path_is_path = matches!(args.path, PathOrFileDescriptor::Path(_));
         let fd_maybe_windows: FD = match &args.path {
             PathOrFileDescriptor::Path(p) => {
@@ -7499,6 +7538,9 @@ impl NodeFS {
     }
 
     pub fn write_file(&mut self, args: &args::WriteFile, _: Flavor) -> Maybe<ret::WriteFile> {
+        if let PathOrFileDescriptor::Path(path) = &args.file {
+            check_path_permission(b"fs.write", path.slice(), sys::Tag::open)?;
+        }
         Self::write_file_with_path_buffer(&mut self.sync_error_buf, args)
     }
 

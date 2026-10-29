@@ -165,6 +165,7 @@ extern "C" bool Bun__closeChildIPC(JSGlobalObject*);
 
 extern "C" bool Bun__GlobalObject__connectedIPC(JSGlobalObject*);
 extern "C" bool Bun__GlobalObject__hasIPC(JSGlobalObject*);
+extern "C" bool Bun__Process__permissionHas(const uint8_t*, size_t, const uint8_t*, size_t);
 extern "C" bool Bun__ensureProcessIPCInitialized(JSGlobalObject*);
 extern "C" const char* Bun__githubURL;
 BUN_DECLARE_HOST_FUNCTION(Bun__Process__send);
@@ -2480,6 +2481,31 @@ static JSValue constructProcessReportObject(VM& vm, JSObject* processObject)
     return report;
 }
 
+JSC_DEFINE_HOST_FUNCTION(Process_permissionHas, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    auto& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto scopeString = callFrame->argument(0).toWTFString(globalObject);
+    RETURN_IF_EXCEPTION(scope, JSValue::encode(jsUndefined()));
+    auto resourceString = callFrame->argument(1).isUndefined() ? WTF::String() : callFrame->argument(1).toWTFString(globalObject);
+    RETURN_IF_EXCEPTION(scope, JSValue::encode(jsUndefined()));
+    auto scopeUtf8 = scopeString.utf8();
+    auto resourceUtf8 = resourceString.utf8();
+    bool allowed = Bun__Process__permissionHas(
+        reinterpret_cast<const uint8_t*>(scopeUtf8.data()), scopeUtf8.length(),
+        reinterpret_cast<const uint8_t*>(resourceUtf8.data()), resourceUtf8.length());
+    return JSValue::encode(jsBoolean(allowed));
+}
+
+static JSValue constructProcessPermissionObject(VM& vm, JSObject* processObject)
+{
+    auto* globalObject = processObject->globalObject();
+    auto* object = JSC::constructEmptyObject(globalObject, globalObject->objectPrototype(), 1);
+    object->putDirect(vm, JSC::Identifier::fromString(vm, "has"_s),
+        JSC::JSFunction::create(vm, globalObject, 2, String("has"_s), Process_permissionHas, ImplementationVisibility::Public), 0);
+    return object;
+}
+
 static JSValue constructProcessConfigObject(VM& vm, JSObject* processObject)
 {
     auto* globalObject = processObject->globalObject();
@@ -4410,6 +4436,7 @@ extern "C" void Process__emitErrorEvent(Zig::GlobalObject* global, EncodedJSValu
   pid                              constructPid                                        PropertyCallback
   platform                         constructPlatform                                   PropertyCallback
   ppid                             processPpid                                         CustomAccessor
+  permission                       constructProcessPermissionObject                   PropertyCallback
   reallyExit                       Process_functionReallyExit                          Function 1
   ref                              Process_ref                                         Function 1
   release                          constructProcessReleaseObject                       PropertyCallback

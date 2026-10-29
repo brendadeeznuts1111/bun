@@ -6,6 +6,7 @@ use bun_core::env_var::feature_flag;
 use bun_core::{self, Environment, Global};
 use bun_jsc::zig_string::ZigString;
 use bun_jsc::{JSGlobalObject, JSValue, ZigStringJsc as _};
+use bun_options_types::context;
 
 unsafe extern "C" {
     safe fn Bun__Process__getArgv(global: &JSGlobalObject) -> JSValue;
@@ -43,6 +44,95 @@ pub(crate) extern "C" fn get_argv(global: &JSGlobalObject) -> JSValue {
 
 pub(crate) extern "C" fn get_exec_argv(global: &JSGlobalObject) -> JSValue {
     Bun__Process__getExecArgv(global)
+}
+
+#[unsafe(export_name = "Bun__Process__permissionHas")]
+pub extern "C" fn permission_has(
+    scope_ptr: *const u8,
+    scope_len: usize,
+    resource_ptr: *const u8,
+    resource_len: usize,
+) -> bool {
+    let scope = if scope_len == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the C++ caller passes a live UTF-8 buffer for the duration
+        // of this synchronous call.
+        unsafe { core::slice::from_raw_parts(scope_ptr, scope_len) }
+    };
+    let resource = if resource_len == 0 {
+        &[][..]
+    } else {
+        // SAFETY: see `scope` above.
+        unsafe { core::slice::from_raw_parts(resource_ptr, resource_len) }
+    };
+    permission_allowed(scope, resource)
+}
+
+/// Query the process-wide experimental permission configuration without
+/// crossing the JS/C++ boundary. Callers use this for native operation hooks.
+pub(crate) fn permission_allowed(scope: &[u8], resource: &[u8]) -> bool {
+    let Some(ctx) = context::try_get() else {
+        return true;
+    };
+    let opts = &ctx.runtime_options;
+    if !opts.experimental_permissions {
+        return true;
+    }
+    let entries = match scope {
+        b"net" => &opts.allow_net,
+        b"env" => &opts.allow_env,
+        b"fs.read" => &opts.allow_read,
+        b"fs.write" => &opts.allow_write,
+        _ => return false,
+    };
+    if entries.is_empty() {
+        return !opts.secure_permissions;
+    }
+    entries.iter().any(|entry| {
+        if entry.as_ref() == b"*" {
+            return true;
+        }
+        if scope == b"net" {
+            if entry.starts_with(b"*.") {
+                let suffix = &entry[1..];
+                return resource.len() > suffix.len()
+                    && resource[resource.len() - suffix.len()..].eq_ignore_ascii_case(suffix);
+            }
+            return entry.eq_ignore_ascii_case(resource);
+        }
+        if scope == b"env" && entry.last() == Some(&b'*') {
+            return resource.starts_with(&entry[..entry.len() - 1]);
+        }
+        if scope == b"fs.read" || scope == b"fs.write" {
+            // This is a lexical check, not symlink confinement. Reject parent
+            // components before prefix matching so they cannot escape a grant.
+            let separator = |byte: u8| byte == b'/' || (cfg!(windows) && byte == b'\\');
+            if resource
+                .split(|byte| separator(*byte))
+                .any(|part| part == b"..")
+                || entry
+                    .split(|byte| separator(*byte))
+                    .any(|part| part == b"..")
+            {
+                return false;
+            }
+            let mut grant = entry.as_ref();
+            if grant.is_empty() || resource.is_empty() {
+                return false;
+            }
+            while grant.len() > 1 && grant.last().is_some_and(|byte| separator(*byte)) {
+                grant = &grant[..grant.len() - 1];
+            }
+            return resource == grant
+                || (resource.starts_with(grant)
+                    && (grant.last().is_some_and(|byte| separator(*byte))
+                        || resource
+                            .get(grant.len())
+                            .is_some_and(|byte| separator(*byte))));
+        }
+        entry.as_ref() == resource
+    })
 }
 
 // ───────────────────────────── exit ─────────────────────────────

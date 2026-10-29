@@ -315,22 +315,21 @@ describe("@types/bun integration test", () => {
     });
   });
 
-  // TypeScript 7's native (Go-based) compiler does not expose a JS compiler API yet,
-  // so unlike the tests above we have to write a real tsconfig and spawn the CLI.
-  // https://devblogs.microsoft.com/typescript/announcing-typescript-7-0-beta/
-  describe("tsgo (TypeScript 7 native preview)", () => {
+  // The native compiler runs through its CLI; the language-service tests above
+  // use the repository's pinned JavaScript compiler API.
+  describe("TypeScript 7 native compiler", () => {
     test("checks without lib.dom.d.ts", async () => {
-      const fixtureDir = await createIsolatedFixture(["@typescript/native-preview"]);
+      const fixtureDir = await createIsolatedFixture(["typescript@7.0.2"]);
 
       const tsconfig = structuredClone(sourceTsconfig);
       tsconfig.compilerOptions.skipLibCheck = false;
       tsconfig.include = ["*.ts", "*.tsx"];
       await Bun.write(join(fixtureDir, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
 
-      const tsgo = join(fixtureDir, "node_modules", "@typescript", "native-preview", "bin", "tsgo.js");
+      const compiler = join(fixtureDir, "node_modules", "typescript", "bin", "tsc");
 
       await using proc = Bun.spawn({
-        cmd: [bunExe(), tsgo, "-p", "."],
+        cmd: [bunExe(), compiler, "-p", "."],
         env: bunEnv,
         cwd: fixtureDir,
         stdout: "pipe",

@@ -25,7 +25,8 @@
   "resolutions": {
     "bun-types": "workspace:packages/bun-types",
     "@types/bun": "workspace:packages/@types/bun",
-    "@types/node": "25.0.0"
+    "@types/node": "25.0.0",
+    "undici-types": "7.16.0"
   },
   "scripts": {
     "build": "bun --silent run build:debug",
@@ -89,6 +90,7 @@
     "machine:linux:amazonlinux": "./scripts/machine.mjs ssh --cloud=aws --arch=x64 --instance-type c7i.2xlarge --os=linux --distro=amazonlinux --release=2023",
     "machine:windows:2019": "./scripts/machine.mjs ssh --cloud=aws --arch=x64 --instance-type c7i.2xlarge --os=windows --release=2019",
     "machine:freebsd": "./scripts/machine.mjs ssh --cloud=aws --arch=x64 --instance-type c7i.2xlarge --os=freebsd --release=14.3",
-    "sync-webkit-source": "bun ./scripts/sync-webkit-source.ts"
+    "sync-webkit-source": "bun ./scripts/sync-webkit-source.ts",
+    "typecheck:permissions": "tsc --noEmit -p test/cli/tsconfig.permissions.json"
   }
 }
