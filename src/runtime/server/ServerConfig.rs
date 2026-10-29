@@ -689,6 +689,11 @@ impl ServerConfig {
     ) -> JsResult<ServerConfig> {
         let vm = arguments.vm;
         let env = vm.env_loader();
+        let read_default = |key: &[u8]| {
+            bun_permissions::allows(bun_permissions::Scope::Env, key)
+                .then(|| env.get(key))
+                .flatten()
+        };
 
         let mut args = ServerConfig {
             address: Address::Tcp {
@@ -707,16 +712,18 @@ impl ServerConfig {
 
             // If this is a node:cluster child, let's default to SO_REUSEPORT.
             // That way you don't have to remember to set reusePort: true in Bun.serve() when using node:cluster.
-            reuse_port: env.get(b"NODE_UNIQUE_ID").is_some(),
+            reuse_port: read_default(b"NODE_UNIQUE_ID").is_some(),
             ..ServerConfig::default()
         };
         let mut has_hostname = false;
 
-        if env.get(b"NODE_ENV").unwrap_or(b"") == b"production" {
+        if read_default(b"NODE_ENV").unwrap_or(b"") == b"production" {
             args.development = DevelopmentOption::Production;
         }
 
-        if arguments.vm.transpiler.options.production {
+        if arguments.vm.transpiler.options.production
+            && bun_permissions::allows(bun_permissions::Scope::Env, b"NODE_ENV")
+        {
             args.development = DevelopmentOption::Production;
         }
 
@@ -726,7 +733,7 @@ impl ServerConfig {
                 const PORT_ENV: [&[u8]; 3] = [b"BUN_PORT", b"PORT", b"NODE_PORT"];
 
                 for port_env in PORT_ENV {
-                    if let Some(port) = env.get(port_env) {
+                    if let Some(port) = read_default(port_env) {
                         if let Ok(_port) = bun_core::immutable::parse_int::<u16>(port, 10) {
                             break 'brk _port;
                         }

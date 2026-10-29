@@ -484,6 +484,11 @@ impl WebWorker {
         preload_modules_len: usize,
     ) -> *mut WebWorker {
         jsc::mark_binding();
+        if !bun_permissions::capability_allowed(bun_permissions::Capability::Worker) {
+            *error_message =
+                BunString::static_(b"Worker permission denied under a restricted policy");
+            return core::ptr::null_mut();
+        }
         log!("[{}] create", this_context_id);
 
         let spec_slice = specifier_str.to_utf8();

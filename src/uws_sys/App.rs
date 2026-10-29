@@ -241,6 +241,18 @@ impl<const SSL: bool> App<SSL> {
         handler: extern "C" fn(*mut UwsListenSocket, *mut c_void),
         user_data: *mut c_void,
     ) {
+        if bun_permissions::check_network(
+            bun_permissions::NetworkOperation::Listen,
+            bun_permissions::NetworkResource::Endpoint {
+                host: b"0.0.0.0",
+                port: u16::try_from(port).unwrap_or(0),
+            },
+        )
+        .is_err()
+        {
+            handler(core::ptr::null_mut(), user_data);
+            return;
+        }
         // Callers supply the C-ABI shim directly (see the RouteHandler note above).
         c::uws_app_listen(
             Self::SSL_FLAG,
@@ -266,6 +278,26 @@ impl<const SSL: bool> App<SSL> {
         user_data: *mut c_void,
         config: c::uws_app_listen_config_t,
     ) {
+        let host = if config.host.is_null() {
+            b"0.0.0.0".as_slice()
+        } else {
+            // SAFETY: config.host is a live NUL-terminated hostname for this call.
+            unsafe { core::ffi::CStr::from_ptr(config.host).to_bytes() }
+        };
+        if bun_permissions::check_network(
+            bun_permissions::NetworkOperation::Listen,
+            bun_permissions::NetworkResource::Endpoint {
+                host,
+                port: u16::try_from(config.port).unwrap_or(0),
+            },
+        )
+        .is_err()
+        {
+            if let Some(handler) = handler {
+                handler(core::ptr::null_mut(), user_data);
+            }
+            return;
+        }
         // Callers supply the C-ABI shim directly.
         // SAFETY: self is a valid app; config.host (if non-null) is NUL-terminated and outlives the call.
         unsafe {
@@ -288,6 +320,20 @@ impl<const SSL: bool> App<SSL> {
         domain_name: &ZStr,
         flags: i32,
     ) {
+        if bun_permissions::check_network(
+            bun_permissions::NetworkOperation::Listen,
+            bun_permissions::NetworkResource::UnixSocket(domain_name.as_bytes()),
+        )
+        .is_err()
+        {
+            handler(
+                core::ptr::null_mut(),
+                domain_name.as_ptr().cast(),
+                flags,
+                user_data,
+            );
+            return;
+        }
         // Callers supply the C-ABI shim directly.
         // SAFETY: self is a valid app; domain_name is NUL-terminated.
         unsafe {

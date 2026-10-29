@@ -43,6 +43,9 @@ pub fn generate_and_write_profile(vm: &mut VM, config: &HeapProfilerConfig) -> R
     // `defer path_buf.deinit()` — handled by Drop.
 
     build_output_path(&mut path_buf, config)?;
+    if !crate::bun_cpu_profiler::profile_path_writable(path_buf.slice()) {
+        return Err(err!(AccessDenied));
+    }
 
     // Convert to OS-specific path (UTF-16 on Windows, UTF-8 elsewhere)
     #[cfg(windows)]
@@ -67,6 +70,9 @@ pub fn generate_and_write_profile(vm: &mut VM, config: &HeapProfilerConfig) -> R
             // Derive directory from the absolute output path
             let dir_path = resolve_path::dirname::<bun_paths::platform::Auto>(path_buf.slice());
             if !dir_path.is_empty() {
+                if !crate::bun_cpu_profiler::profile_directory_writable(dir_path) {
+                    return Err(err!(AccessDenied));
+                }
                 let _ = Fd::cwd().make_path(dir_path);
                 // Retry write
                 #[cfg(windows)]
@@ -104,9 +110,9 @@ fn build_output_path(path: &mut AutoAbsPath, config: &HeapProfilerConfig) -> Res
         generate_default_filename(&mut filename_buf, config.text_format)?
     };
 
-    // Append directory if specified
+    // CLI directories may be absolute; append only accepts relative segments.
     if !config.dir.is_empty() {
-        path.append(config.dir)?;
+        path.join(&[config.dir]).expect("unreachable");
     }
 
     // Append filename

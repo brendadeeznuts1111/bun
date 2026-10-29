@@ -627,6 +627,22 @@ impl<'a> CopyFile<'a> {
     }
 
     pub fn run_async(&mut self) {
+        if let Err(err) = super::check_file_permission(
+            bun_permissions::Scope::FsRead,
+            &self.source_file_store.pathlike,
+            true,
+        )
+        .and_then(|()| {
+            super::check_file_permission(
+                bun_permissions::Scope::FsWrite,
+                &self.destination_file_store.pathlike,
+                true,
+            )
+        }) {
+            self.system_error = Some(err.to_system_error());
+            return;
+        }
+
         #[cfg(windows)]
         {
             return; // why

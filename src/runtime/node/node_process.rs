@@ -6,7 +6,6 @@ use bun_core::env_var::feature_flag;
 use bun_core::{self, Environment, Global};
 use bun_jsc::zig_string::ZigString;
 use bun_jsc::{JSGlobalObject, JSValue, ZigStringJsc as _};
-use bun_options_types::context;
 
 unsafe extern "C" {
     safe fn Bun__Process__getArgv(global: &JSGlobalObject) -> JSValue;
@@ -69,70 +68,88 @@ pub extern "C" fn permission_has(
     permission_allowed(scope, resource)
 }
 
-/// Query the process-wide experimental permission configuration without
-/// crossing the JS/C++ boundary. Callers use this for native operation hooks.
+/// Query the immutable whole-process resource policy.
 pub(crate) fn permission_allowed(scope: &[u8], resource: &[u8]) -> bool {
-    let Some(ctx) = context::try_get() else {
-        return true;
+    use bun_permissions::{Capability, Scope};
+    let capability = match scope {
+        b"run" | b"child_process" => Some(Capability::Subprocess),
+        b"worker" | b"worker_threads" => Some(Capability::Worker),
+        b"ffi" => Some(Capability::ForeignFunction),
+        b"inspector" => Some(Capability::Inspector),
+        b"sys" => Some(Capability::SystemInformation),
+        _ => None,
     };
-    let opts = &ctx.runtime_options;
-    if !opts.experimental_permissions {
-        return true;
+    if let Some(capability) = capability {
+        return bun_permissions::capability_allowed(capability);
     }
-    let entries = match scope {
-        b"net" => &opts.allow_net,
-        b"env" => &opts.allow_env,
-        b"fs.read" => &opts.allow_read,
-        b"fs.write" => &opts.allow_write,
+    let scope = match scope {
+        b"net" => Scope::Net,
+        b"env" => Scope::Env,
+        b"fs.read" => Scope::FsRead,
+        b"fs.write" => Scope::FsWrite,
         _ => return false,
     };
-    if entries.is_empty() {
-        return !opts.secure_permissions;
-    }
-    entries.iter().any(|entry| {
-        if entry.as_ref() == b"*" {
-            return true;
-        }
-        if scope == b"net" {
-            if entry.starts_with(b"*.") {
-                let suffix = &entry[1..];
-                return resource.len() > suffix.len()
-                    && resource[resource.len() - suffix.len()..].eq_ignore_ascii_case(suffix);
-            }
-            return entry.eq_ignore_ascii_case(resource);
-        }
-        if scope == b"env" && entry.last() == Some(&b'*') {
-            return resource.starts_with(&entry[..entry.len() - 1]);
-        }
-        if scope == b"fs.read" || scope == b"fs.write" {
-            // This is a lexical check, not symlink confinement. Reject parent
-            // components before prefix matching so they cannot escape a grant.
-            let separator = |byte: u8| byte == b'/' || (cfg!(windows) && byte == b'\\');
-            if resource
-                .split(|byte| separator(*byte))
-                .any(|part| part == b"..")
-                || entry
-                    .split(|byte| separator(*byte))
-                    .any(|part| part == b"..")
-            {
-                return false;
-            }
-            let mut grant = entry.as_ref();
-            if grant.is_empty() || resource.is_empty() {
-                return false;
-            }
-            while grant.len() > 1 && grant.last().is_some_and(|byte| separator(*byte)) {
-                grant = &grant[..grant.len() - 1];
-            }
-            return resource == grant
-                || (resource.starts_with(grant)
-                    && (grant.last().is_some_and(|byte| separator(*byte))
-                        || resource
-                            .get(grant.len())
-                            .is_some_and(|byte| separator(*byte))));
-        }
-        entry.as_ref() == resource
-    })
+    bun_permissions::allows(scope, resource)
+}
+
+#[unsafe(export_name = "Bun__Process__environmentRestricted")]
+pub extern "C" fn environment_restricted() -> bool {
+    bun_permissions::is_restricted(bun_permissions::Scope::Env)
+}
+
+#[unsafe(export_name = "Bun__Process__capabilitiesRestricted")]
+pub extern "C" fn capabilities_restricted() -> bool {
+    bun_permissions::any_restricted()
+}
+
+#[unsafe(export_name = "Bun__Process__nativeCodeAllowed")]
+pub extern "C" fn native_code_allowed() -> bool {
+    bun_permissions::capability_allowed(bun_permissions::Capability::ForeignFunction)
+}
+
+#[unsafe(export_name = "Bun__Process__systemAllowed")]
+pub extern "C" fn system_allowed() -> bool {
+    bun_permissions::capability_allowed(bun_permissions::Capability::SystemInformation)
+}
+
+#[unsafe(export_name = "Bun__Process__subprocessAllowed")]
+pub extern "C" fn subprocess_allowed() -> bool {
+    bun_permissions::capability_allowed(bun_permissions::Capability::Subprocess)
+}
+
+/// # Safety
+/// Nonempty buffers are live for this synchronous C++ authorization call.
+#[unsafe(export_name = "Bun__Process__filePathsRestricted")]
+pub extern "C" fn file_paths_restricted() -> bool {
+    bun_permissions::requires_path_check(bun_permissions::Scope::FsRead)
+        || bun_permissions::requires_path_check(bun_permissions::Scope::FsWrite)
+}
+
+#[unsafe(export_name = "Bun__Process__fileEntryAllowed")]
+pub unsafe extern "C" fn file_entry_allowed(
+    scope_ptr: *const u8,
+    scope_len: usize,
+    path_ptr: *const u8,
+    path_len: usize,
+) -> bool {
+    let scope = if scope_len == 0 {
+        &[][..]
+    } else {
+        // SAFETY: caller contract above.
+        unsafe { core::slice::from_raw_parts(scope_ptr, scope_len) }
+    };
+    let path = if path_len == 0 {
+        &[][..]
+    } else {
+        // SAFETY: caller contract above.
+        unsafe { core::slice::from_raw_parts(path_ptr, path_len) }
+    };
+    let scope = match scope {
+        b"fs.read" => bun_permissions::Scope::FsRead,
+        b"fs.write" => bun_permissions::Scope::FsWrite,
+        _ => return false,
+    };
+    bun_permissions::check_entry(scope, path)
 }
 
 // ───────────────────────────── exit ─────────────────────────────

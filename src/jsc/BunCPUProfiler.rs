@@ -12,6 +12,8 @@ use bun_sys::{self, Errno, Fd, FdDirExt as _};
 pub(crate) enum ProfilerError {
     #[error("WriteFailed")]
     WriteFailed,
+    #[error("AccessDenied")]
+    AccessDenied,
     #[error("FilenameTooLong")]
     FilenameTooLong,
 }
@@ -108,6 +110,9 @@ fn write_profile_to_file(
     // (defer path_buf.deinit() — handled by Drop)
 
     build_output_path(&mut path_buf, config, is_md_format)?;
+    if !profile_path_writable(path_buf.slice()) {
+        return Err(ProfilerError::AccessDenied);
+    }
 
     // Convert to OS-specific path (UTF-16 on Windows, UTF-8 elsewhere)
     #[cfg(windows)]
@@ -126,6 +131,9 @@ fn write_profile_to_file(
         let errno = err.get_errno();
         if errno == Errno::ENOENT || errno == Errno::EPERM || errno == Errno::EACCES {
             if !config.dir.is_empty() {
+                if !profile_directory_writable(config.dir) {
+                    return Err(ProfilerError::AccessDenied);
+                }
                 let _ = Fd::cwd().make_path(config.dir);
                 // Retry write
                 let retry_result = bun_sys::File::write_file_os_path(
@@ -145,6 +153,38 @@ fn write_profile_to_file(
     }
 
     Ok(())
+}
+
+/// Validate both the file's directory entry and its resolved write target.
+pub(crate) fn profile_path_writable(path: &[u8]) -> bool {
+    bun_permissions::check_entry(bun_permissions::Scope::FsWrite, path)
+        && bun_permissions::check_path(bun_permissions::Scope::FsWrite, path)
+}
+
+/// A grant for a nested output does not authorize creating its missing ancestors.
+pub(crate) fn profile_directory_writable(path: &[u8]) -> bool {
+    if !bun_permissions::requires_path_check(bun_permissions::Scope::FsWrite) {
+        return true;
+    }
+    if !profile_path_writable(path) {
+        return false;
+    }
+    for (index, byte) in path.iter().enumerate() {
+        if index > 0 && (*byte == b'/' || (cfg!(windows) && *byte == b'\\')) {
+            let prefix = &path[..index];
+            let name = bun_core::ZBox::from_bytes(prefix);
+            match bun_sys::stat(name.as_zstr()) {
+                Ok(_) => {}
+                Err(error) if error.get_errno() == bun_sys::E::ENOENT => {
+                    if !profile_path_writable(prefix) {
+                        return false;
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+    true
 }
 
 fn build_output_path(

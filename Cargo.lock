@@ -370,6 +370,7 @@ dependencies = [
  "bun_parsers",
  "bun_paths",
  "bun_perf",
+ "bun_permissions",
  "bun_ptr",
  "bun_resolve_builtins",
  "bun_resolver",
@@ -695,6 +696,7 @@ dependencies = [
  "bun_core",
  "bun_dispatch",
  "bun_paths",
+ "bun_permissions",
  "bun_sys",
  "bun_url",
  "bun_which",
@@ -779,6 +781,7 @@ dependencies = [
  "bun_collections",
  "bun_core",
  "bun_paths",
+ "bun_permissions",
  "bun_sys",
  "const_format",
  "enum-map",
@@ -831,6 +834,7 @@ dependencies = [
  "bun_http_types",
  "bun_io",
  "bun_libdeflate_sys",
+ "bun_permissions",
  "bun_picohttp",
  "bun_ptr",
  "bun_sys",
@@ -869,6 +873,7 @@ dependencies = [
  "bun_jsc",
  "bun_libdeflate_sys",
  "bun_opaque",
+ "bun_permissions",
  "bun_picohttp",
  "bun_ptr",
  "bun_sha_hmac",
@@ -1197,6 +1202,7 @@ dependencies = [
  "bun_opaque",
  "bun_options_types",
  "bun_paths",
+ "bun_permissions",
  "bun_ptr",
  "bun_resolve_builtins",
  "bun_resolver",
@@ -1481,6 +1487,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bun_permissions"
+version = "0.0.0"
+dependencies = [
+ "bun_core",
+ "bun_paths",
+ "bun_sys",
+]
+
+[[package]]
 name = "bun_picohttp"
 version = "0.0.0"
 dependencies = [
@@ -1586,6 +1601,7 @@ dependencies = [
  "bun_parsers",
  "bun_paths",
  "bun_perf",
+ "bun_permissions",
  "bun_ptr",
  "bun_resolve_builtins",
  "bun_semver",
@@ -1686,6 +1702,7 @@ dependencies = [
  "bun_parsers",
  "bun_patch_jsc",
  "bun_paths",
+ "bun_permissions",
  "bun_picohttp",
  "bun_ptr",
  "bun_resolve_builtins",
@@ -1938,6 +1955,7 @@ dependencies = [
  "bun_io",
  "bun_opaque",
  "bun_output",
+ "bun_permissions",
  "bun_ptr",
  "bun_spawn_sys",
  "bun_sys",
@@ -2194,6 +2212,7 @@ dependencies = [
  "bun_libuv_sys",
  "bun_opaque",
  "bun_paths",
+ "bun_permissions",
  "bun_windows_sys",
  "const_format",
  "enum-map",

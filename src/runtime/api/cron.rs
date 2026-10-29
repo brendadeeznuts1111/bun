@@ -688,6 +688,11 @@ pub fn cron_register(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSV
     if args[1].is_callable() {
         return CronJob::register(global, args[0], args[1]);
     }
+    if !bun_permissions::capability_allowed(bun_permissions::Capability::Subprocess) {
+        return Err(global.throw_type_error(format_args!(
+            "Subprocess permission denied for persistent cron scheduling"
+        )));
+    }
     if args[0].is_string() && args[2].is_undefined() {
         return Err(global.throw_invalid_arguments(format_args!(
             "Bun.cron(schedule, handler) expects a function handler as the second argument"
@@ -1289,6 +1294,11 @@ impl CronRemoveJob {
 // free fn: `#[host_fn]` Free shim calls bare `cron_remove(..)`
 #[bun_jsc::host_fn]
 pub fn cron_remove(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
+    if !bun_permissions::capability_allowed(bun_permissions::Capability::Subprocess) {
+        return Err(global.throw_type_error(format_args!(
+            "Subprocess permission denied for persistent cron removal"
+        )));
+    }
     let args = frame.arguments_as_array::<1>();
     if !args[0].is_string() {
         return Err(global

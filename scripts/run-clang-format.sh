@@ -34,7 +34,7 @@ while IFS= read -r -d '' file; do
     if [[ "$file" =~ src/runtime/ffi/ffi- ]] || \
        [[ "$file" =~ src/napi/ ]] || \
        [[ "$file" =~ src/jsc/bindings/libuv/ ]] || \
-       [[ "$file" =~ src/jsc/bindings/sqlite/ ]] || \
+       [[ "$file" =~ src/jsc/bindings/sqlite/ && "$file" != src/jsc/bindings/sqlite/PermissionVFS.h ]] || \
        [[ "$file" =~ packages/bun-usockets/.*libuv ]] || \
        [[ "$file" =~ vendor/ ]]; then
         continue

@@ -101,7 +101,12 @@ pub(crate) const DOM_CALL: DomCall = DomCall {
     put: FFI__ptr__put,
 };
 
-pub fn to_js(global_object: &JSGlobalObject) -> JSValue {
+pub fn to_js(global_object: &JSGlobalObject) -> JsResult<JSValue> {
+    if !bun_permissions::capability_allowed(bun_permissions::Capability::ForeignFunction) {
+        return Err(global_object.throw(format_args!(
+            "FFI permission denied under a restricted policy"
+        )));
+    }
     // Unrolled manually; keep in sync with `FIELDS` below.
     let fields = FIELDS();
     let object = JSValue::create_empty_object(global_object, fields.len() + 2);
@@ -137,7 +142,7 @@ pub fn to_js(global_object: &JSGlobalObject) -> JSValue {
     unsafe { (DOM_CALL.put)(std::ptr::from_ref(global_object).cast_mut(), object) };
     object.put(global_object, b"read", reader::to_js(global_object));
 
-    object
+    Ok(object)
 }
 
 pub mod reader {
@@ -731,7 +736,7 @@ pub(crate) fn to_buffer(
     }
 }
 
-pub(crate) fn getter(global_object: &JSGlobalObject, _: &JSObject) -> JSValue {
+pub(crate) fn getter(global_object: &JSGlobalObject, _: &JSObject) -> JsResult<JSValue> {
     to_js(global_object)
 }
 

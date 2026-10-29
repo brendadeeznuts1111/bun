@@ -231,3 +231,29 @@ test("--heap-prof-name without --heap-prof or --heap-prof-md shows warning", asy
   const files = Array.from(glob.scanSync({ cwd: String(dir) }));
   expect(files.length).toBe(0);
 });
+
+for (const flag of ["--heap-prof", "--heap-prof-md"]) {
+  test(`${flag} accepts an absolute output directory`, async () => {
+    using directory = tempDir("heap-prof-absolute", { profiles: {} });
+    const outputDirectory = join(String(directory), "profiles");
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        flag,
+        `--heap-prof-dir=${outputDirectory}`,
+        "--heap-prof-name=profile",
+        "-e",
+        "console.log('ran')",
+      ],
+      cwd: String(directory),
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(exitCode, stderr).toBe(0);
+    expect(stdout).toBe("ran\n");
+    expect(stderr).toContain("Heap profile written to:");
+    expect((await Bun.file(join(outputDirectory, "profile")).text()).length).toBeGreaterThan(0);
+  });
+}

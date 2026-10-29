@@ -233,45 +233,46 @@ impl<'a> Loader<'a> {
     pub fn load_tracy(&self) {}
 
     pub fn get_s3_credentials(&mut self) -> &S3Credentials {
-        if self.aws_credentials.is_none() {
+        // Rebuild restricted credentials so a bootstrap cache cannot expose denied values.
+        if self.aws_credentials.is_none()
+            || bun_permissions::is_restricted(bun_permissions::Scope::Env)
+        {
+            let read_credential = |key: &[u8]| {
+                bun_permissions::allows(bun_permissions::Scope::Env, key)
+                    .then(|| self.get(key))
+                    .flatten()
+            };
             // Copy to `Box<[u8]>` so the cached struct owns its bytes and we
             // can release the `&self` borrow before writing `&mut self.aws_credentials`.
-            // One-shot and cached — copies are negligible.
-            let access_key_id: Box<[u8]> = self
-                .get(b"S3_ACCESS_KEY_ID")
-                .or_else(|| self.get(b"AWS_ACCESS_KEY_ID"))
+            let access_key_id: Box<[u8]> = read_credential(b"S3_ACCESS_KEY_ID")
+                .or_else(|| read_credential(b"AWS_ACCESS_KEY_ID"))
                 .map(Box::from)
                 .unwrap_or_default();
-            let secret_access_key: Box<[u8]> = self
-                .get(b"S3_SECRET_ACCESS_KEY")
-                .or_else(|| self.get(b"AWS_SECRET_ACCESS_KEY"))
+            let secret_access_key: Box<[u8]> = read_credential(b"S3_SECRET_ACCESS_KEY")
+                .or_else(|| read_credential(b"AWS_SECRET_ACCESS_KEY"))
                 .map(Box::from)
                 .unwrap_or_default();
-            let region: Box<[u8]> = self
-                .get(b"S3_REGION")
-                .or_else(|| self.get(b"AWS_REGION"))
+            let region: Box<[u8]> = read_credential(b"S3_REGION")
+                .or_else(|| read_credential(b"AWS_REGION"))
                 .map(Box::from)
                 .unwrap_or_default();
 
             let mut endpoint: Box<[u8]> = Box::default();
             let mut insecure_http = false;
-            if let Some(endpoint_) = self
-                .get(b"S3_ENDPOINT")
-                .or_else(|| self.get(b"AWS_ENDPOINT"))
+            if let Some(endpoint_) =
+                read_credential(b"S3_ENDPOINT").or_else(|| read_credential(b"AWS_ENDPOINT"))
             {
                 let url = URL::parse(endpoint_);
                 endpoint = Box::from(url.host_with_path());
                 insecure_http = url.is_http();
             }
 
-            let bucket: Box<[u8]> = self
-                .get(b"S3_BUCKET")
-                .or_else(|| self.get(b"AWS_BUCKET"))
+            let bucket: Box<[u8]> = read_credential(b"S3_BUCKET")
+                .or_else(|| read_credential(b"AWS_BUCKET"))
                 .map(Box::from)
                 .unwrap_or_default();
-            let session_token: Box<[u8]> = self
-                .get(b"S3_SESSION_TOKEN")
-                .or_else(|| self.get(b"AWS_SESSION_TOKEN"))
+            let session_token: Box<[u8]> = read_credential(b"S3_SESSION_TOKEN")
+                .or_else(|| read_credential(b"AWS_SESSION_TOKEN"))
                 .map(Box::from)
                 .unwrap_or_default();
 

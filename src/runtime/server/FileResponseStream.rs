@@ -17,7 +17,7 @@ use bun_io::pipe_reader::WindowsFlags as ReaderFlags;
 use bun_io::{BufferedReader, FileType, ReadState};
 #[cfg(unix)]
 use bun_io::{FilePollFlag, PosixFlags as ReaderFlags};
-use bun_sys::{self as sys, Fd};
+use bun_sys::{self as sys, Fd, FdExt};
 use bun_uws::{AnyResponse, WriteResult};
 
 use crate::server::jsc::{AnyTask, EventLoopHandle, Task, VirtualMachine};
@@ -116,6 +116,18 @@ pub(crate) struct StartOptions {
 
 impl FileResponseStream {
     pub(crate) fn start(opts: &StartOptions) {
+        if let Err(err) = crate::webcore::blob::check_file_permission(
+            bun_permissions::Scope::FsRead,
+            &crate::webcore::node_types::PathOrFileDescriptor::Fd(opts.fd),
+            true,
+        ) {
+            if opts.auto_close {
+                opts.fd.close();
+            }
+            (opts.on_error)(opts.ctx, opts.resp, err);
+            return;
+        }
+
         let use_sendfile = can_sendfile(opts.resp, opts.file_type, opts.length);
 
         // Heap-allocate; the raw pointer is handed to uWS callbacks and freed

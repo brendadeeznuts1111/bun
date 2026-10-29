@@ -1360,6 +1360,9 @@ impl VirtualMachine {
     /// [`reload_entry_point`] does. No-op when hooks aren't installed (pure
     /// `bun_jsc` unit tests).
     pub fn ensure_debugger(&mut self, block_until_connected: bool) -> Result<(), bun_core::Error> {
+        if !bun_permissions::inspector_allowed() {
+            return Err(bun_core::Error::from_name("PermissionDenied"));
+        }
         if let Some(hooks) = runtime_hooks() {
             // SAFETY: hook contract — `self` is the live per-thread VM.
             unsafe { (hooks.ensure_debugger)(self, block_until_connected) };

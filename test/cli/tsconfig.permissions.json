@@ -7,6 +7,7 @@
   },
   "include": [
     "permissions.test.ts",
+    "heap-prof.test.ts",
     "inspect/permission-reporter.test.ts",
     "../js/bun/test/expect-extend-preload.test.ts"
   ],

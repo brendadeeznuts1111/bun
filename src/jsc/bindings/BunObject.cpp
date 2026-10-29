@@ -23,6 +23,7 @@
 #include "wtf/SIMDUTF.h"
 #include <JavaScriptCore/ObjectConstructor.h>
 #include <JavaScriptCore/JSObjectInlines.h>
+#include <JavaScriptCore/CustomGetterSetter.h>
 #include "headers.h"
 #include "BunObject.h"
 #include "WebCoreJSBuiltins.h"
@@ -52,6 +53,7 @@
 #endif
 
 extern "C" size_t Bun__Feature__heap_snapshot;
+extern "C" bool Bun__Process__nativeCodeAllowed();
 
 BUN_DECLARE_HOST_FUNCTION(Bun__DNS__lookup);
 BUN_DECLARE_HOST_FUNCTION(Bun__DNS__resolve);
@@ -1151,9 +1153,25 @@ static JSValue constructWebViewObject(VM& vm, JSObject* bunObject)
     return zigGlobalObject->m_JSWebViewClassStructure.constructor(zigGlobalObject);
 }
 
+static JSC_DEFINE_CUSTOM_GETTER(bunObjectDeniedFFI, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue, PropertyName))
+{
+    auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
+    throwTypeError(globalObject, scope, "FFI permission denied under a restricted policy"_s);
+    return {};
+}
+
 JSC::JSObject* createBunObject(VM& vm, JSObject* globalObject)
 {
-    return JSBunObject::create(vm, uncheckedDowncast<Zig::GlobalObject>(globalObject));
+    auto* object = JSBunObject::create(vm, uncheckedDowncast<Zig::GlobalObject>(globalObject));
+    if (!Bun__Process__nativeCodeAllowed()) {
+        // Static PropertyCallback initializers require a nonempty value and
+        // cannot represent an authorization exception. Shadow that initializer
+        // with an ordinary throwing getter before any FFI object is created.
+        object->putDirectCustomAccessor(vm, Identifier::fromString(vm, "FFI"_s),
+            CustomGetterSetter::create(vm, bunObjectDeniedFFI, nullptr),
+            PropertyAttribute::DontDelete | PropertyAttribute::CustomAccessor);
+    }
+    return object;
 }
 
 static void exportBunObject(JSC::VM& vm, JSC::JSGlobalObject* globalObject, JSC::JSObject* object, Vector<JSC::Identifier, 4>& exportNames, JSC::MarkedArgumentBuffer& exportValues)

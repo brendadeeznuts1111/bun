@@ -556,12 +556,17 @@ extern "C" JSC::JSGlobalObject* Zig__GlobalObject__create(void* console_client, 
                     strings.append(jsString(vm, value));
                 }
 
-                auto env = JSC::constructEmptyObject(globalObject, globalObject->objectPrototype(), size >= JSFinalObject::maxInlineCapacity ? JSFinalObject::maxInlineCapacity : size);
+                auto env = Bun::createEnvironmentVariablesObject(globalObject, size >= JSFinalObject::maxInlineCapacity ? JSFinalObject::maxInlineCapacity : size);
                 size_t i = 0;
                 for (auto k : map) {
+                    auto value = strings.at(i++);
+                    if (!Bun::isEnvironmentVariableAllowed(k.key)) continue;
+#if OS(WINDOWS)
+                    if (Bun__Process__environmentRestricted()) k.key = k.key.convertToASCIIUppercase();
+#endif
                     // They can have environment variables with numbers as keys.
                     // So we must use putDirectMayBeIndex to handle that.
-                    env->putDirectMayBeIndex(globalObject, JSC::Identifier::fromString(vm, WTF::move(k.key)), strings.at(i++));
+                    env->putDirectMayBeIndex(globalObject, JSC::Identifier::fromString(vm, WTF::move(k.key)), value);
                 }
                 globalObject->m_processEnvObject.set(vm, globalObject, env);
             }

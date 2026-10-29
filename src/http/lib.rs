@@ -2460,6 +2460,33 @@ impl<'a> HTTPClient<'a> {
         // (it needs `&mut self`, which would alias every other `self.*` call in the body),
         // so it is called explicitly before each return.
 
+        let destination = if self.unix_socket_path.slice().is_empty() {
+            bun_permissions::NetworkResource::Endpoint {
+                host: self.url.hostname,
+                port: self.url.get_port_auto(),
+            }
+        } else {
+            bun_permissions::NetworkResource::UnixSocket(self.unix_socket_path.slice())
+        };
+        let denied =
+            bun_permissions::check_network(bun_permissions::NetworkOperation::Connect, destination)
+                .is_err()
+                || self.http_proxy.as_ref().is_some_and(|proxy| {
+                    bun_permissions::check_network(
+                        bun_permissions::NetworkOperation::Connect,
+                        bun_permissions::NetworkResource::Endpoint {
+                            host: proxy.hostname,
+                            port: proxy.get_port_auto(),
+                        },
+                    )
+                    .is_err()
+                });
+        if denied {
+            self.fail(err!(AccessDenied));
+            self.complete_connecting_process();
+            return;
+        }
+
         // Aborted before connecting
         if self.signals.get(signals::Field::Aborted) {
             self.fail(err!(AbortedBeforeConnecting));

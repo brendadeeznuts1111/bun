@@ -1,0 +1,57 @@
+name: Permission declarations and lint
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/fix-experimental-permissions]
+  pull_request:
+    paths:
+      - "src/permissions/**"
+      - "src/js/node/net.ts"
+      - "packages/bun-types/**"
+      - "test/cli/permissions.test.ts"
+      - "test/cli/heap-prof.test.ts"
+      - "test/cli/tsconfig.permissions.json"
+      - "test/cli/inspect/custom.test.reporter.ts"
+      - "test/cli/inspect/permission-reporter.test.ts"
+      - "test/harness.ts"
+      - "test/package.json"
+      - "test/bun.lock"
+      - "test/tsconfig.json"
+      - "tsconfig.json"
+      - "oxlint.json"
+      - ".github/actions/setup-bun/**"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/permissions.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  declarations:
+    name: Permission types and JavaScript lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          bun-version: "1.4.4"
+      - name: Verify runtime and install dependencies
+        run: |
+          test "$(bun --version)" = "1.4.4"
+          bun install --frozen-lockfile
+          bun install --frozen-lockfile --cwd test
+      - name: Check permission test types
+        run: bun run typecheck:permissions
+      - name: Check packaged declarations
+        run: bun test test/integration/bun-types/bun-types.test.ts
+      - name: Lint runtime JavaScript
+        run: bun run lint

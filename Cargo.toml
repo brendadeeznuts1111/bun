@@ -19,6 +19,7 @@ members = [
   "src/libarchive",
   "src/md",
   "src/paths",
+  "src/permissions",
   "src/resolver",
   "src/safety",
   "src/semver",
@@ -432,6 +433,7 @@ bun_wyhash = { path = "src/wyhash" }
 bun_hash = { path = "src/hash" }
 bun_boringssl_sys = { path = "src/boringssl_sys" }
 bun_core = { path = "src/bun_core" }
+bun_permissions = { path = "src/permissions" }
 bun_core_macros = { path = "src/bun_core_macros" }
 bun_output_tags = { path = "src/bun_output_tags" }
 bun_patch_jsc = { path = "src/patch_jsc" }

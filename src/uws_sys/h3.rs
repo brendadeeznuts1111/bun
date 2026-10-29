@@ -537,6 +537,24 @@ impl App {
                 thunk::zst::<H>()(ud, ls.as_mut());
             }
         }
+        let host = if config.host.is_null() {
+            b"0.0.0.0".as_slice()
+        } else {
+            // SAFETY: config.host is a live NUL-terminated hostname for this call.
+            unsafe { core::ffi::CStr::from_ptr(config.host).to_bytes() }
+        };
+        if bun_permissions::check_network(
+            bun_permissions::NetworkOperation::Listen,
+            bun_permissions::NetworkResource::Endpoint {
+                host,
+                port: config.port,
+            },
+        )
+        .is_err()
+        {
+            cb::<UD, H>(core::ptr::null_mut(), ud.cast());
+            return;
+        }
         // SAFETY: self is a live FFI handle; config fields valid; trampoline is `extern "C"`
         unsafe {
             c::uws_h3_app_listen_with_config(

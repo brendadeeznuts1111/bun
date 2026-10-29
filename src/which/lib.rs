@@ -19,7 +19,12 @@ mod scope {
 use scope::which as which_log;
 
 #[cfg(not(windows))]
-fn is_valid(buf: &mut PathBuffer, segment: &[u8], bin: &[u8]) -> Option<u16> {
+fn is_valid(
+    buf: &mut PathBuffer,
+    segment: &[u8],
+    bin: &[u8],
+    authorize: fn(&[u8]) -> bool,
+) -> Option<u16> {
     let prefix_len = segment.len() + 1; // includes trailing path separator
     let len = prefix_len + bin.len();
     let len_z = len + 1; // includes null terminator
@@ -33,7 +38,7 @@ fn is_valid(buf: &mut PathBuffer, segment: &[u8], bin: &[u8]) -> Option<u16> {
     buf[len] = 0;
     // SAFETY: buf[len] == 0 written above
     let filepath = ZStr::from_buf(&buf[..], len);
-    if !bun_sys::is_executable_file_path(filepath) {
+    if !authorize(filepath.as_bytes()) || !bun_sys::is_executable_file_path(filepath) {
         return None;
     }
     Some(u16::try_from(filepath.len()).expect("int cast"))
@@ -80,6 +85,17 @@ pub fn which_for_spawn<'a>(
 // Like /usr/bin/which but without needing to exec a child process
 // Remember to resolve the symlink if necessary
 pub fn which<'a>(buf: &'a mut PathBuffer, path: &[u8], cwd: &[u8], bin: &[u8]) -> Option<&'a ZStr> {
+    which_checked(buf, path, cwd, bin, |_| true)
+}
+
+/// Authorize every candidate before probing the filesystem, including Windows suffixes.
+pub fn which_checked<'a>(
+    buf: &'a mut PathBuffer,
+    path: &[u8],
+    cwd: &[u8],
+    bin: &[u8],
+    authorize: fn(&[u8]) -> bool,
+) -> Option<&'a ZStr> {
     if bin.len() > MAX_PATH_BYTES {
         return None;
     }
@@ -94,7 +110,7 @@ pub fn which<'a>(buf: &'a mut PathBuffer, path: &[u8], cwd: &[u8], bin: &[u8]) -
     #[cfg(windows)]
     {
         let mut convert_buf = w_path_buffer_pool::get();
-        let result = which_win(&mut *convert_buf, path, cwd, bin)?;
+        let result = which_win_checked(&mut *convert_buf, path, cwd, bin, authorize)?;
         let result_converted =
             bun_core::strings::convert_utf16_to_utf8_in_buffer(&mut buf[..], result);
         // Capture len/ptr before re-borrowing buf (borrowck).
@@ -118,7 +134,7 @@ pub fn which<'a>(buf: &'a mut PathBuffer, path: &[u8], cwd: &[u8], bin: &[u8]) -
             buf[bin.len()] = 0;
             // SAFETY: buf[bin.len()] == 0 written above
             let bin_z = unsafe { ZStr::from_raw_mut(buf.as_mut_ptr(), bin.len()) };
-            if bun_sys::is_executable_file_path(&*bin_z) {
+            if authorize(bin_z.as_bytes()) && bun_sys::is_executable_file_path(&*bin_z) {
                 return Some(&*bin_z);
             }
             // Do not look absolute paths in $PATH
@@ -136,6 +152,7 @@ pub fn which<'a>(buf: &'a mut PathBuffer, path: &[u8], cwd: &[u8], bin: &[u8]) -
                     buf,
                     cwd_trimmed,
                     strings::without_prefix_comptime(bin, b"./"),
+                    authorize,
                 ) {
                     // SAFETY: is_valid wrote NUL at buf[len]
                     return Some(ZStr::from_buf(&buf[..], len as usize));
@@ -146,7 +163,7 @@ pub fn which<'a>(buf: &'a mut PathBuffer, path: &[u8], cwd: &[u8], bin: &[u8]) -
         }
 
         for segment in path.split(|b| *b == DELIMITER).filter(|s| !s.is_empty()) {
-            if let Some(len) = is_valid(buf, segment, bin) {
+            if let Some(len) = is_valid(buf, segment, bin, authorize) {
                 // SAFETY: is_valid wrote NUL at buf[len]
                 return Some(ZStr::from_buf(&buf[..], len as usize));
             }
@@ -219,6 +236,7 @@ fn search_bin(
     buf: &mut WPathBuffer,
     path_size: usize,
     check_windows_extensions: bool,
+    authorize: fn(&[u8]) -> bool,
 ) -> Option<&mut [u16]> {
     // `search_bin` only ever runs on Windows; the POSIX arm here exists solely
     // so the public `which_win` symbol type-checks on all targets.
@@ -228,7 +246,14 @@ fn search_bin(
             // On Windows, files without extensions are not executable
             // Therefore, we should only care about this check when the file already has an extension.
             // SAFETY: caller wrote NUL at buf[path_size]
-            if bun_sys::exists_os_path(WStr::from_buf(&buf[..], path_size), true) {
+            let mut permission_buffer = path_buffer_pool::get();
+            let candidate = strings::convert_utf16_to_utf8_in_buffer(
+                &mut permission_buffer[..],
+                &buf[..path_size],
+            );
+            if authorize(candidate)
+                && bun_sys::exists_os_path(WStr::from_buf(&buf[..], path_size), true)
+            {
                 return Some(&mut buf[..path_size]);
             }
         }
@@ -239,10 +264,17 @@ fn search_bin(
             for ext in WIN_EXTENSIONS_W {
                 buf[path_size + 1..path_size + 1 + 3].copy_from_slice(ext);
                 // SAFETY: buf[path_size + 1 + ext.len()] == 0 written above
-                if bun_sys::exists_os_path(
-                    WStr::from_buf(&buf[..], path_size + 1 + ext.len()),
-                    true,
-                ) {
+                let mut permission_buffer = path_buffer_pool::get();
+                let candidate = strings::convert_utf16_to_utf8_in_buffer(
+                    &mut permission_buffer[..],
+                    &buf[..path_size + 1 + ext.len()],
+                );
+                if authorize(candidate)
+                    && bun_sys::exists_os_path(
+                        WStr::from_buf(&buf[..], path_size + 1 + ext.len()),
+                        true,
+                    )
+                {
                     return Some(&mut buf[..path_size + 1 + ext.len()]);
                 }
             }
@@ -251,7 +283,7 @@ fn search_bin(
     }
     #[cfg(not(windows))]
     {
-        let _ = (buf, path_size, check_windows_extensions);
+        let _ = (buf, path_size, check_windows_extensions, authorize);
         None
     }
 }
@@ -263,6 +295,7 @@ fn search_bin_in_path<'a>(
     path: &[u8],
     bin: &[u8],
     check_windows_extensions: bool,
+    authorize: fn(&[u8]) -> bool,
 ) -> Option<&'a mut [u16]> {
     if path.is_empty() {
         return None;
@@ -307,7 +340,7 @@ fn search_bin_in_path<'a>(
     let path_size = segment_utf16_len + 1 + bin_utf16.len();
     buf[path_size] = 0;
 
-    search_bin(buf, path_size, check_windows_extensions)
+    search_bin(buf, path_size, check_windows_extensions, authorize)
 }
 
 /// This is the windows version of `which`.
@@ -318,6 +351,16 @@ pub fn which_win<'a>(
     path: &[u8],
     cwd: &[u8],
     bin: &[u8],
+) -> Option<&'a [u16]> {
+    which_win_checked(buf, path, cwd, bin, |_| true)
+}
+
+fn which_win_checked<'a>(
+    buf: &'a mut WPathBuffer,
+    path: &[u8],
+    cwd: &[u8],
+    bin: &[u8],
+    authorize: fn(&[u8]) -> bool,
 ) -> Option<&'a [u16]> {
     if bin.is_empty() {
         return None;
@@ -341,7 +384,7 @@ pub fn which_win<'a>(
         // Capture len before re-borrowing buf (borrowck).
         let bin_utf16_len = bin_utf16.len();
         buf[bin_utf16_len] = 0;
-        return search_bin(buf, bin_utf16_len, check_windows_extensions).map(|w| &*w);
+        return search_bin(buf, bin_utf16_len, check_windows_extensions, authorize).map(|w| &*w);
     }
 
     // check if bin is in cwd
@@ -357,6 +400,7 @@ pub fn which_win<'a>(
             cwd,
             strings::without_prefix_comptime(bin, b"./"),
             check_windows_extensions,
+            authorize,
         ) {
             posix_to_platform_in_place(bin_path);
             return Some(&*bin_path);
@@ -378,6 +422,7 @@ pub fn which_win<'a>(
             segment_part,
             bin,
             check_windows_extensions,
+            authorize,
         ) {
             return Some(&*bin_path);
         }

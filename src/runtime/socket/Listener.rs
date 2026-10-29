@@ -183,6 +183,21 @@ impl Listener {
         let vm = VirtualMachine::get().as_mut();
 
         let socket_config = SocketConfig::from_js(vm, opts, global, true)?;
+        let resource = match socket_config.port {
+            Some(port) => bun_permissions::NetworkResource::Endpoint {
+                host: socket_config.hostname_or_unix.slice(),
+                port,
+            },
+            None => {
+                bun_permissions::NetworkResource::UnixSocket(socket_config.hostname_or_unix.slice())
+            }
+        };
+        if bun_permissions::check_network(bun_permissions::NetworkOperation::Listen, resource)
+            .is_err()
+        {
+            return Err(global.throw(format_args!("Socket network permission denied")));
+        }
+
         #[cfg(windows)]
         let mut socket_config = socket_config;
         // Teardown handled by Drop on SocketConfig
@@ -944,7 +959,7 @@ impl Listener {
     // Note: no #[bun_jsc::host_fn] — BunObject.rs::static_adapters owns the
     // C-ABI shim (it extracts `opts` from the CallFrame and calls this directly).
     pub fn connect(global: &JSGlobalObject, opts: JSValue) -> JsResult<JSValue> {
-        Self::connect_inner(global, None, None, opts)
+        Self::connect_inner(global, None, None, opts, None)
     }
 
     pub fn connect_inner(
@@ -952,6 +967,7 @@ impl Listener {
         prev_maybe_tcp: Option<*mut TCPSocket>,
         prev_maybe_tls: Option<*mut TLSSocket>,
         opts: JSValue,
+        authorization: Option<bun_permissions::ResolvedNetworkEndpoint>,
     ) -> JsResult<JSValue> {
         if opts.is_empty_or_undefined_or_null() || opts.is_boolean() || !opts.is_object() {
             return Err(global.throw_invalid_arguments(format_args!("Expected options object")));
@@ -964,6 +980,27 @@ impl Listener {
         // field pointer, but here handlers live in a standalone heap
         // allocation (see below), so that would read past the allocation.
         let mut socket_config = SocketConfig::from_js(vm, opts, global, false)?;
+        let resource = match socket_config.port {
+            Some(port) => bun_permissions::NetworkResource::Endpoint {
+                host: socket_config.hostname_or_unix.slice(),
+                port,
+            },
+            None => {
+                bun_permissions::NetworkResource::UnixSocket(socket_config.hostname_or_unix.slice())
+            }
+        };
+        let authorized_resolution = socket_config.port.is_some_and(|port| {
+            authorization
+                .as_ref()
+                .is_some_and(|token| token.matches(socket_config.hostname_or_unix.slice(), port))
+        });
+        if !authorized_resolution
+            && bun_permissions::check_network(bun_permissions::NetworkOperation::Connect, resource)
+                .is_err()
+        {
+            return Err(global.throw(format_args!("Socket network permission denied")));
+        }
+
         // Note: `socket_config` cleanup (excluding handlers) handled by Drop on SocketConfig
 
         let port = socket_config.port;
@@ -1372,6 +1409,7 @@ impl Listener {
                 allow_half_open,
                 port,
                 promise_value,
+                authorization.as_ref(),
             )
         } else {
             connect_finish::<false>(
@@ -1386,6 +1424,7 @@ impl Listener {
                 allow_half_open,
                 port,
                 promise_value,
+                authorization.as_ref(),
             )
         }
     }
@@ -1464,6 +1503,7 @@ fn connect_finish<const IS_SSL: bool>(
     allow_half_open: bool,
     port: Option<u16>,
     promise_value: JSValue,
+    authorization: Option<&bun_permissions::ResolvedNetworkEndpoint>,
 ) -> JsResult<JSValue> {
     let socket: *mut NewSocket<IS_SSL> = if let Some(prev_ptr) = maybe_previous {
         // SAFETY: caller passes a live NewSocket<IS_SSL>
@@ -1556,7 +1596,7 @@ fn connect_finish<const IS_SSL: bool>(
     }
     // Note: `do_connect` reads `self.connection` directly so no second
     // borrow is needed here.
-    if socket_ref.do_connect().is_err() {
+    if socket_ref.do_connect(authorization).is_err() {
         let errno = if port.is_none() {
             // Preserve the real errno from the failed connect(2) on a unix path:
             // connecting to an existing non-socket file is ENOTSOCK, a

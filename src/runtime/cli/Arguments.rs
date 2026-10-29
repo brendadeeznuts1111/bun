@@ -261,6 +261,21 @@ pub(crate) const RUNTIME_PARAMS_: &[ParamType] = &[
         "--experimental-http3-fetch        Honor Alt-Svc: h3 in fetch() and upgrade to HTTP/3. Same as BUN_FEATURE_FLAG_EXPERIMENTAL_HTTP3_CLIENT=1"
     ),
     parse_param!("--experimental-permissions        Enable Bun's experimental permission model"),
+    parse_param!(
+        "--allow-inspector                 Allow inspector access under the experimental permission model"
+    ),
+    parse_param!(
+        "--allow-run                       Grant unrestricted subprocess and shell authority (experimental)"
+    ),
+    parse_param!(
+        "--allow-worker                    Allow worker threads inheriting the process permission policy (experimental)"
+    ),
+    parse_param!(
+        "--allow-ffi                       Grant unrestricted native-code authority (experimental)"
+    ),
+    parse_param!(
+        "--allow-sys                       Allow host information and process control (experimental)"
+    ),
     parse_param!("--secure                          Deny permissions by default (experimental)"),
     parse_param!("--allow-read <STR>...              Allow filesystem reads (experimental)"),
     parse_param!("--allow-write <STR>...             Allow filesystem writes (experimental)"),
@@ -1098,12 +1113,22 @@ pub fn parse(cmd: CommandTag, ctx: Context<'_>) -> Result<api::TransformOptions,
         ctx.runtime_options.experimental_http3_fetch = args.flag(b"--experimental-http3-fetch");
         ctx.runtime_options.experimental_permissions = args.flag(b"--experimental-permissions");
         ctx.runtime_options.secure_permissions = args.flag(b"--secure");
+        ctx.runtime_options.allow_inspector = args.flag(b"--allow-inspector");
+        ctx.runtime_options.allow_run = args.flag(b"--allow-run");
+        ctx.runtime_options.allow_worker = args.flag(b"--allow-worker");
+        ctx.runtime_options.allow_ffi = args.flag(b"--allow-ffi");
+        ctx.runtime_options.allow_sys = args.flag(b"--allow-sys");
         ctx.runtime_options.allow_read = slice_to_owned(args.options(b"--allow-read"));
         ctx.runtime_options.allow_write = slice_to_owned(args.options(b"--allow-write"));
         ctx.runtime_options.allow_net = slice_to_owned(args.options(b"--allow-net"));
         ctx.runtime_options.allow_env = slice_to_owned(args.options(b"--allow-env"));
 
         let has_permission_options = ctx.runtime_options.secure_permissions
+            || ctx.runtime_options.allow_inspector
+            || ctx.runtime_options.allow_run
+            || ctx.runtime_options.allow_worker
+            || ctx.runtime_options.allow_ffi
+            || ctx.runtime_options.allow_sys
             || !ctx.runtime_options.allow_read.is_empty()
             || !ctx.runtime_options.allow_write.is_empty()
             || !ctx.runtime_options.allow_net.is_empty()
@@ -1116,7 +1141,7 @@ pub fn parse(cmd: CommandTag, ctx: Context<'_>) -> Result<api::TransformOptions,
         if !ctx.runtime_options.allow_read.is_empty() || !ctx.runtime_options.allow_write.is_empty()
         {
             Output::err_generic(
-                "⚠️ Warning: filesystem permissions are experimental and partial; Node fs path operations are gated, while Bun.file/symlink canonicalization remain planned",
+                "⚠️ Warning: experimental filesystem permissions constrain trusted application code; use an OS security boundary for hostile code",
                 (),
             );
         }
@@ -1553,6 +1578,40 @@ pub fn parse(cmd: CommandTag, ctx: Context<'_>) -> Result<api::TransformOptions,
             .set(args.options(b"--breakpoint-resolve").to_vec());
         let _ =
             cli::debug_flags::PRINT_BREAKPOINTS.set(args.options(b"--breakpoint-print").to_vec());
+    }
+
+    let cwd = bun_sys::getcwd_alloc().map_err(bun_core::Error::from)?;
+    let runtime = &ctx.runtime_options;
+    let policy = bun_permissions::Config {
+        enabled: runtime.experimental_permissions,
+        secure: runtime.secure_permissions,
+        allow_inspector: runtime.allow_inspector,
+        allow_run: runtime.allow_run,
+        allow_worker: runtime.allow_worker,
+        allow_ffi: runtime.allow_ffi,
+        allow_sys: runtime.allow_sys,
+        working_directory: cwd.as_zstr().as_bytes().into(),
+        read: runtime.allow_read.clone(),
+        write: runtime.allow_write.clone(),
+        net: runtime.allow_net.clone(),
+        env: runtime.allow_env.clone(),
+    };
+    if let Err(error) = bun_permissions::initialize(policy) {
+        Output::err_generic(
+            "Invalid experimental permission configuration: {}",
+            (error,),
+        );
+        Global::exit(1);
+    }
+
+    if matches!(ctx.runtime_options.debugger, Debugger::Enable(_))
+        && !bun_permissions::inspector_allowed()
+    {
+        Output::err_generic(
+            "Inspector access requires --allow-inspector under a restricted permission policy",
+            (),
+        );
+        Global::exit(1);
     }
 
     Ok(opts)

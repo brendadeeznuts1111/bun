@@ -566,6 +566,17 @@ impl UDPSocket {
 
         let config = this.config.get();
         let hostname_z = config.hostname.to_owned_slice_z();
+        if bun_permissions::check_network(
+            bun_permissions::NetworkOperation::Listen,
+            bun_permissions::NetworkResource::Endpoint {
+                host: hostname_z.as_bytes(),
+                port: config.port,
+            },
+        )
+        .is_err()
+        {
+            return Err(global_this.throw(format_args!("UDP network permission denied")));
+        }
 
         let created = uws::udp::Socket::create(
             this.loop_,
@@ -616,6 +627,17 @@ impl UDPSocket {
 
         if let Some(connect) = &this.config.get().connect {
             let address_z = connect.address.to_owned_slice_z();
+            if bun_permissions::check_network(
+                bun_permissions::NetworkOperation::Connect,
+                bun_permissions::NetworkResource::Endpoint {
+                    host: address_z.as_bytes(),
+                    port: connect.port,
+                },
+            )
+            .is_err()
+            {
+                return Err(global_this.throw(format_args!("UDP network permission denied")));
+            }
             // `Socket` is an `opaque_ffi!` ZST — `opaque_mut` is the safe deref.
             let ret = uws::udp::Socket::opaque_mut(this.socket.get().unwrap())
                 .connect(address_z.as_ptr(), connect.port as u32);
@@ -801,6 +823,11 @@ impl UDPSocket {
             JSValue::js_number(0.0),
             arguments[0],
             &mut addr,
+            if drop {
+                None
+            } else {
+                Some(bun_permissions::NetworkOperation::Listen)
+            },
         )? {
             return Err(global_this.throw_value(
                 bun_sys::Error::from_code_int(
@@ -823,6 +850,7 @@ impl UDPSocket {
                 JSValue::js_number(0.0),
                 arguments[1],
                 &mut interface,
+                None,
             )? {
             if addr.ss_family != interface.ss_family {
                 return Err(global_this.throw_invalid_arguments(format_args!(
@@ -893,6 +921,7 @@ impl UDPSocket {
             JSValue::js_number(0.0),
             arguments[0],
             &mut source_addr,
+            None,
         )? {
             return Err(global_this.throw_value(
                 bun_sys::Error::from_code_int(
@@ -909,6 +938,11 @@ impl UDPSocket {
             JSValue::js_number(0.0),
             arguments[1],
             &mut group_addr,
+            if drop {
+                None
+            } else {
+                Some(bun_permissions::NetworkOperation::Listen)
+            },
         )? {
             return Err(global_this.throw_value(
                 bun_sys::Error::from_code_int(
@@ -937,6 +971,7 @@ impl UDPSocket {
                 JSValue::js_number(0.0),
                 arguments[2],
                 &mut interface,
+                None,
             )? {
             if source_addr.ss_family != interface.ss_family {
                 return Err(global_this.throw_invalid_arguments(format_args!(
@@ -1022,6 +1057,7 @@ impl UDPSocket {
             JSValue::js_number(0.0),
             arguments[0],
             &mut addr,
+            None,
         )? {
             return Ok(JSValue::FALSE);
         }
@@ -1256,7 +1292,13 @@ impl UDPSocket {
                 continue;
             }
             if i % 3 == 2 {
-                if !this.parse_addr(global_this, port, val, &mut addrs[slice_idx])? {
+                if !this.parse_addr(
+                    global_this,
+                    port,
+                    val,
+                    &mut addrs[slice_idx],
+                    Some(bun_permissions::NetworkOperation::Connect),
+                )? {
                     return Err(
                         global_this.throw_invalid_arguments(format_args!("Invalid address"))
                     );
@@ -1369,7 +1411,13 @@ impl UDPSocket {
         let mut addr: sockaddr_storage = bun_core::ffi::zeroed();
         let addr_ptr: *const c_void = 'brk: {
             if let Some(dest) = dst {
-                if !this.parse_addr(global_this, dest.port, dest.address, &mut addr)? {
+                if !this.parse_addr(
+                    global_this,
+                    dest.port,
+                    dest.address,
+                    &mut addr,
+                    Some(bun_permissions::NetworkOperation::Connect),
+                )? {
                     return Err(
                         global_this.throw_invalid_arguments(format_args!("Invalid address"))
                     );
@@ -1429,8 +1477,8 @@ impl UDPSocket {
         port_val: JSValue,
         address_val: JSValue,
         storage: &mut sockaddr_storage,
+        operation: Option<bun_permissions::NetworkOperation>,
     ) -> JsResult<bool> {
-        let _ = self;
         let number = port_val.coerce_to_i32(global_this)?;
         let port: u16 = if number < 1 || number > 0xffff {
             0
@@ -1443,6 +1491,30 @@ impl UDPSocket {
         // the `%` position for scope-id parsing.
         let mut address_slice: Vec<u8> = str.to_owned_slice_z().into_vec_with_nul();
         let bytes_len = address_slice.len() - 1; // exclude trailing NUL
+        if let Some(operation) = operation {
+            let permission_port = if matches!(operation, bun_permissions::NetworkOperation::Listen)
+            {
+                let socket = self
+                    .socket
+                    .get()
+                    .ok_or_else(|| global_this.throw(format_args!("Socket is closed")))?;
+                u16::try_from(uws::udp::Socket::opaque_mut(socket).bound_port())
+                    .map_err(|_| global_this.throw(format_args!("Invalid UDP socket port")))?
+            } else {
+                port
+            };
+            if bun_permissions::check_network(
+                operation,
+                bun_permissions::NetworkResource::Endpoint {
+                    host: &address_slice[..bytes_len],
+                    port: permission_port,
+                },
+            )
+            .is_err()
+            {
+                return Err(global_this.throw(format_args!("UDP network permission denied")));
+            }
+        }
 
         // SAFETY: storage is large enough to hold sockaddr_in.
         let addr4 = unsafe { &mut *std::ptr::from_mut(storage).cast::<sockaddr_in>() };
@@ -1768,6 +1840,17 @@ impl UDPSocket {
             u16::try_from(connect_port).expect("int cast")
         };
 
+        if bun_permissions::check_network(
+            bun_permissions::NetworkOperation::Connect,
+            bun_permissions::NetworkResource::Endpoint {
+                host: connect_host.as_bytes(),
+                port: port,
+            },
+        )
+        .is_err()
+        {
+            return Err(global_this.throw(format_args!("UDP network permission denied")));
+        }
         let Some(socket) = this.socket.get() else {
             return Err(global_this.throw(format_args!("Socket is closed")));
         };

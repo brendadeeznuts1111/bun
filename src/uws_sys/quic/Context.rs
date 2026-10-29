@@ -112,6 +112,17 @@ impl Context {
         reject_unauthorized: bool,
         user: *mut c_void,
     ) -> ConnectResult {
+        if bun_permissions::check_network(
+            bun_permissions::NetworkOperation::Connect,
+            bun_permissions::NetworkResource::Endpoint {
+                host: host.to_bytes(),
+                port,
+            },
+        )
+        .is_err()
+        {
+            return ConnectResult::Err;
+        }
         let mut qs: *mut Socket = core::ptr::null_mut();
         let mut pc: *mut PendingConnect = core::ptr::null_mut();
         // SAFETY: self is a live us_quic_socket_context_t; out-params are valid for write.

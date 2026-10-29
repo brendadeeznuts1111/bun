@@ -292,6 +292,11 @@ impl PathWatcher {
     /// `rel_path` is borrowed — `onPathUpdatePosix` dupes it before enqueuing.
     #[cfg(not(windows))]
     fn emit(&mut self, event_type: EventType, rel_path: &[u8], is_file: bool) {
+        #[cfg(not(windows))]
+        if !permission_allows_event(self.path.as_bytes(), rel_path) {
+            return;
+        }
+
         let timestamp = bun_core::time::milli_timestamp();
         let h = hash(rel_path);
         for entry in self.handlers.iterator() {
@@ -414,6 +419,25 @@ impl PathWatcher {
 // watch()
 // ────────────────────────────────────────────────────────────────────────────────
 
+/// Event names are directory entries, including deleted entries whose targets
+/// no longer exist. Never resolve the leaf as a file read.
+pub(crate) fn permission_allows_event(root: &[u8], relative: &[u8]) -> bool {
+    if !bun_permissions::requires_path_check(bun_permissions::Scope::FsRead) {
+        return true;
+    }
+    if relative.is_empty() || relative == bun_paths::basename(root) {
+        return bun_permissions::check_entry(bun_permissions::Scope::FsRead, root);
+    }
+    if bun_paths::is_absolute(relative) {
+        return bun_permissions::check_entry(bun_permissions::Scope::FsRead, relative);
+    }
+    let mut full = Vec::with_capacity(root.len() + relative.len() + 1);
+    full.extend_from_slice(root);
+    full.push(bun_paths::SEP);
+    full.extend_from_slice(relative);
+    bun_permissions::check_entry(bun_permissions::Scope::FsRead, &full)
+}
+
 pub fn watch(
     vm: &VirtualMachine,
     path: &ZStr,
@@ -422,6 +446,9 @@ pub fn watch(
     update_end: UpdateEndCallback,
     ctx: *mut c_void,
 ) -> sys::Result<*mut PathWatcher> {
+    if !bun_permissions::check_path(bun_permissions::Scope::FsRead, path.as_bytes()) {
+        return Err(sys::Error::from_code(E::EACCES, Tag::watch).with_path(path.as_bytes()));
+    }
     // Assert the callback/updateEnd are what node_fs_watcher passes.
     // Compare against the *exact* fn pointers `FSWatcher` passes (not local wrappers,
     // which would be distinct fn items with distinct addresses).
@@ -581,6 +608,9 @@ fn walk_subtree<const DIRS_ONLY: bool>(
     rel_dir: &[u8],
     cb: &mut impl FnMut(&ZStr, &[u8], bool),
 ) {
+    if !bun_permissions::check_path(bun_permissions::Scope::FsRead, abs_dir.as_bytes()) {
+        return;
+    }
     let dfd = match sys::open(
         abs_dir,
         sys::O::RDONLY | sys::O::DIRECTORY | sys::O::CLOEXEC,
@@ -760,6 +790,9 @@ impl Linux {
         abs_path: &ZStr,
         subpath: &[u8],
     ) -> sys::Result<()> {
+        if !bun_permissions::check_path(bun_permissions::Scope::FsRead, abs_path.as_bytes()) {
+            return Err(sys::Error::from_code(E::EACCES, Tag::watch).with_path(abs_path.as_bytes()));
+        }
         let plat: *mut Linux = manager.platform.get();
         let mask: u32 = if watcher.is_file && subpath.is_empty() {
             inotify_masks::WATCH_FILE_MASK
@@ -1340,6 +1373,9 @@ impl Kqueue {
         subpath: &[u8],
         is_file: bool,
     ) -> sys::Result<()> {
+        if !bun_permissions::check_path(bun_permissions::Scope::FsRead, abs_path.as_bytes()) {
+            return Err(sys::Error::from_code(E::EACCES, Tag::watch).with_path(abs_path.as_bytes()));
+        }
         use bun_sys::freebsd::{EV, EVFILT, Kevent, NOTE, kevent};
         let plat: *mut Kqueue = manager.platform.get();
         // O_EVTONLY: we only need the fd for kevent registration, never for I/O.

@@ -250,6 +250,12 @@ impl Fs {
         cached_file_descriptor: Option<Fd>,
         shared: &mut MutableString,
     ) -> Result<Entry, bun_core::Error> {
+        fs_mod::check_read_permission(path.as_bytes())?;
+        if let Some(fd) = cached_file_descriptor {
+            if !bun_permissions::check_fd(bun_permissions::Scope::FsRead, fd) {
+                return Err(bun_core::err!("AccessDenied"));
+            }
+        }
         let rfs = &_fs.fs;
 
         let mut owned: Option<bun_sys::File> = None;
@@ -338,6 +344,22 @@ impl Fs {
         _file_handle: Option<Fd>,
         arena: Option<&bun_alloc::Arena>,
     ) -> Result<Entry, bun_core::Error> {
+        fs_mod::check_read_permission(path)?;
+        if let Some(fd) = _file_handle {
+            if !bun_permissions::check_fd(bun_permissions::Scope::FsRead, fd) {
+                return Err(bun_core::err!("AccessDenied"));
+            }
+        } else if feature_flags::STORE_FILE_DESCRIPTORS
+            && dirname_fd.is_valid()
+            && !bun_permissions::check_at_path(
+                bun_permissions::Scope::FsRead,
+                dirname_fd,
+                bun_paths::basename(path),
+                false,
+            )
+        {
+            return Err(bun_core::err!("AccessDenied"));
+        }
         let rfs = &_fs.fs;
 
         // Single let-expression assigning `file_handle` on each branch, avoiding

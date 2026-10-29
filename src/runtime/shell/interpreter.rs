@@ -700,6 +700,9 @@ impl Interpreter {
         cwd: Option<&[u8]>,
         from_source: bool,
     ) -> Result<ExitCode, bun_core::Error> {
+        if !bun_permissions::capability_allowed(bun_permissions::Capability::Shell) {
+            return Err(bun_core::err!("AccessDenied"));
+        }
         if from_source {
             bun_analytics::features::standalone_shell.fetch_add(1, Ordering::Relaxed);
         }
@@ -3025,6 +3028,11 @@ pub fn create_shell_interpreter(
     use crate::jsc::{ArgumentsSlice, JsClass as _};
     use crate::shell::parsed_shell_script::ParsedShellScript;
 
+    if !bun_permissions::capability_allowed(bun_permissions::Capability::Shell) {
+        return Err(global.throw(format_args!(
+            "Shell permission denied under a restricted policy"
+        )));
+    }
     let arguments_ = callframe.arguments_old::<3>();
     // SAFETY: bun_vm() returns the live thread-local VM for a Bun-owned global.
     let vm = global.bun_vm();

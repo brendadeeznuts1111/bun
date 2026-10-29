@@ -633,6 +633,15 @@ impl ReadFile {
         #[cfg(not(windows))]
         {
             self.io_task = Some(task);
+            if let Err(err) = super::check_file_permission(
+                bun_permissions::Scope::FsRead,
+                &self.file_store.pathlike,
+                true,
+            ) {
+                self.system_error = Some(err.to_system_error().into());
+                self.on_finish();
+                return;
+            }
 
             if self.file_store.pathlike.is_fd() {
                 self.opened_fd = self.file_store.pathlike.fd();
@@ -1054,6 +1063,17 @@ impl<'a> ReadFileUV<'a> {
         on_complete_fn: ReadFileOnReadFileCallback,
         handler: *mut c_void,
     ) {
+        if let Err(err) = super::check_file_permission(
+            bun_permissions::Scope::FsRead,
+            &store.data.as_file().pathlike,
+            true,
+        ) {
+            on_complete_fn(
+                handler,
+                ReadFileResultType::Err(err.to_system_error().into()),
+            );
+            return;
+        }
         log!("ReadFileUV.start");
         // SAFETY: `event_loop` is the per-thread `EventLoop` singleton owned by
         // the VM (`global.bun_vm().event_loop()`); it strictly outlives this

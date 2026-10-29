@@ -348,6 +348,11 @@ pub(crate) fn spawn_maybe_sync<const IS_SYNC: bool>(
     args_: JSValue,
     secondary_args_value: Option<JSValue>,
 ) -> JsResult<JSValue> {
+    if !bun_permissions::capability_allowed(bun_permissions::Capability::Subprocess) {
+        return Err(global_this.throw(format_args!(
+            "Subprocess permission denied under a restricted policy"
+        )));
+    }
     if IS_SYNC {
         // We skip this on Windows due to test failures.
         #[cfg(not(windows))]

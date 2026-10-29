@@ -607,8 +607,12 @@ pub(crate) fn which(global_this: &JSGlobalObject, callframe: &CallFrame) -> JsRe
     }
 
     // SAFETY: `transpiler.env` / `.fs` are process-lifetime singletons set during VM init.
-    let mut path_str =
-        ZigStringSlice::from_utf8_never_free(vm.env_loader().get(b"PATH").unwrap_or(b""));
+    let inherited_path = if bun_permissions::allows(bun_permissions::Scope::Env, b"PATH") {
+        vm.env_loader().get(b"PATH").unwrap_or(b"")
+    } else {
+        b""
+    };
+    let mut path_str = ZigStringSlice::from_utf8_never_free(inherited_path);
     let mut cwd_str = ZigStringSlice::from_utf8_never_free(vm.top_level_dir());
 
     if let Some(arg) = arguments.next_eat() {
@@ -623,11 +627,12 @@ pub(crate) fn which(global_this: &JSGlobalObject, callframe: &CallFrame) -> JsRe
         }
     }
 
-    if let Some(bin_path) = bun_which::which(
+    if let Some(bin_path) = bun_which::which_checked(
         &mut *path_buf,
         path_str.slice(),
         cwd_str.slice(),
         bin_str.slice(),
+        |candidate| bun_permissions::check_path(bun_permissions::Scope::FsRead, candidate),
     ) {
         return Ok(ZigString::init(bin_path).with_encoding().to_js(global_this));
     }
@@ -1020,6 +1025,11 @@ pub(crate) fn open_in_editor(
     global_this: &JSGlobalObject,
     callframe: &CallFrame,
 ) -> JsResult<JSValue> {
+    if !bun_permissions::capability_allowed(bun_permissions::Capability::Subprocess) {
+        return Err(global_this.throw_type_error(format_args!(
+            "Editor access is denied by the permission policy"
+        )));
+    }
     let args = callframe.arguments_old::<4>();
     // SAFETY: bun_vm() returns the live per-thread singleton.
     let vm = global_this.bun_vm();
@@ -1748,6 +1758,18 @@ pub(crate) fn mmap_file(global_this: &JSGlobalObject, callframe: &CallFrame) -> 
                             global_this.throw_invalid_arguments(format_args!("Path too long"))
                         );
                     }
+                    if !bun_permissions::check_path(
+                        bun_permissions::Scope::FsRead,
+                        path_str.slice(),
+                    ) || !bun_permissions::check_path(
+                        bun_permissions::Scope::FsWrite,
+                        path_str.slice(),
+                    ) {
+                        use bun_jsc::SysErrorJsc as _;
+                        let err = bun_sys::Error::from_code(bun_sys::E::EACCES, bun_sys::Tag::mmap)
+                            .with_path(path_str.slice());
+                        return Err(global_this.throw_value(err.to_js(global_this)));
+                    }
                     let paths = &[path_str.slice()];
                     break 'brk bun_paths::resolve_path::join_abs_string_buf::<
                         bun_paths::resolve_path::platform::Auto,
@@ -1821,6 +1843,16 @@ pub(crate) fn mmap_file(global_this: &JSGlobalObject, callframe: &CallFrame) -> 
             }
         }
 
+        // mmap_file opens O_RDWR even for private mappings. Check after
+        // option getters have run, immediately before opening the resource.
+        if !bun_permissions::check_path(bun_permissions::Scope::FsRead, buf_z.as_bytes())
+            || !bun_permissions::check_path(bun_permissions::Scope::FsWrite, buf_z.as_bytes())
+        {
+            use bun_jsc::SysErrorJsc as _;
+            let err = bun_sys::Error::from_code(bun_sys::E::EACCES, bun_sys::Tag::mmap)
+                .with_path(buf_z.as_bytes());
+            return Err(global_this.throw_value(err.to_js(global_this)));
+        }
         let map = match bun_sys::mmap_file(buf_z, flags, map_size, offset) {
             Ok(map) => map,
             Err(err) => {

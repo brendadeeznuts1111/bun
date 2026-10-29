@@ -168,8 +168,16 @@ pub(crate) fn new_detached_socket(global: &JSGlobalObject, frame: &CallFrame) ->
 
 #[bun_jsc::host_fn]
 pub(crate) fn do_connect(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
-    let [prev, opts] = frame.arguments_as_array::<2>();
+    let [prev, opts, token] = frame.arguments_as_array::<3>();
     let maybe_tcp = prev.as_::<TCPSocket>();
     let maybe_tls = prev.as_::<TLSSocket>();
-    Listener::connect_inner(global, maybe_tcp, maybe_tls, opts)
+    let authorization = token
+        .as_class_ref::<crate::socket::socket_address::SocketAddress>()
+        .and_then(|endpoint| endpoint.take_network_authorization());
+    Listener::connect_inner(global, maybe_tcp, maybe_tls, opts, authorization)
+}
+
+#[bun_jsc::host_fn]
+pub(crate) fn lookup_for_connect(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
+    crate::dns_jsc::Resolver::lookup_for_connect(global, frame)
 }

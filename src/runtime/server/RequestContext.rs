@@ -1638,6 +1638,11 @@ where
         let global_this = self.server().global_this();
         let resp = self.resp.expect("infallible: resp bound");
 
+        if let Err(err) =
+            crate::webcore::blob::check_blob_permission(&blob, bun_permissions::Scope::FsRead, true)
+        {
+            return self.run_error_handler(err.to_js(global_this));
+        }
         self.blob = AnyBlob::Blob(blob);
         let crate::webcore::blob::store::Data::File(file) = &self.blob.store().unwrap().data else {
             unreachable!("do_sendfile called with non-file blob");

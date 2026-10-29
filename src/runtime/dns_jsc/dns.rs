@@ -187,11 +187,12 @@ pub(super) mod lib_info {
         this: &Resolver,
         query: &GetAddrInfo,
         global_this: &JSGlobalObject,
+        authorization: LookupAuthorization,
     ) -> JSValue {
         bun_core::Environment::only_mac();
 
         let Some(getaddrinfo_async_start_) = getaddrinfo_async_start() else {
-            return lib_c::lookup(this, query, global_this);
+            return lib_c::lookup(this, query, global_this, authorization);
         };
 
         let key = get_addr_info_request::PendingCacheKey::init(query);
@@ -199,7 +200,7 @@ pub(super) mod lib_info {
             this.get_or_put_into_pending_cache(&key, PendingCacheField::PendingHostCacheNative);
 
         if let CacheHit::Inflight(inflight) = cache {
-            let dns_lookup = DNSLookup::init(this.as_ctx_ptr(), global_this);
+            let dns_lookup = DNSLookup::init(this.as_ctx_ptr(), global_this, authorization);
             // SAFETY: inflight points into resolver's HiveArray buffer
             unsafe { (*inflight).append(dns_lookup) };
             // SAFETY: `dns_lookup` was just heap-allocated by `DNSLookup::init`.
@@ -218,6 +219,7 @@ pub(super) mod lib_info {
             query,
             global_this,
             PendingCacheField::PendingHostCacheNative,
+            authorization,
         );
         // SAFETY: request was just heap-allocated in init() and is exclusively owned here.
         let promise_value = unsafe { (*request).head.promise.value() };
@@ -321,13 +323,14 @@ pub(super) mod lib_c {
         this: &Resolver,
         query_init: &GetAddrInfo,
         global_this: &JSGlobalObject,
+        authorization: LookupAuthorization,
     ) -> JSValue {
         let key = get_addr_info_request::PendingCacheKey::init(query_init);
 
         let cache =
             this.get_or_put_into_pending_cache(&key, PendingCacheField::PendingHostCacheNative);
         if let CacheHit::Inflight(inflight) = cache {
-            let dns_lookup = DNSLookup::init(this.as_ctx_ptr(), global_this);
+            let dns_lookup = DNSLookup::init(this.as_ctx_ptr(), global_this, authorization);
             // SAFETY: inflight points into resolver's pending-cache HiveArray slot.
             unsafe { (*inflight).append(dns_lookup) };
             // SAFETY: dns_lookup just heap-allocated; owned by the inflight list.
@@ -345,6 +348,7 @@ pub(super) mod lib_c {
             &query,
             global_this,
             PendingCacheField::PendingHostCacheNative,
+            authorization,
         );
         // SAFETY: request was just heap-allocated in init() and is exclusively owned here.
         let promise_value = unsafe { (*request).head.promise.value() };
@@ -417,13 +421,14 @@ pub(super) mod lib_uv_backend {
         this: &Resolver,
         query: GetAddrInfo,
         global_this: &JSGlobalObject,
+        authorization: LookupAuthorization,
     ) -> JsResult<JSValue> {
         let key = get_addr_info_request::PendingCacheKey::init(&query);
 
         let cache =
             this.get_or_put_into_pending_cache(&key, PendingCacheField::PendingHostCacheNative);
         if let CacheHit::Inflight(inflight) = cache {
-            let dns_lookup = DNSLookup::init(this.as_ctx_ptr(), global_this);
+            let dns_lookup = DNSLookup::init(this.as_ctx_ptr(), global_this, authorization);
             unsafe { (*inflight).append(dns_lookup) };
             return Ok(unsafe { (*dns_lookup).promise.value() });
         }
@@ -435,6 +440,7 @@ pub(super) mod lib_uv_backend {
             &query,
             global_this,
             PendingCacheField::PendingHostCacheNative,
+            authorization,
         );
 
         let hints = query.options.to_libc();
@@ -1370,6 +1376,7 @@ impl GetAddrInfoRequest {
         query: &GetAddrInfo,
         global_this: &JSGlobalObject,
         cache_field: PendingCacheField,
+        authorization: LookupAuthorization,
     ) -> *mut Self {
         bun_output::scoped_log!(GetAddrInfoRequest, "init");
         let mut poll_ref = KeepAlive::init();
@@ -1380,6 +1387,7 @@ impl GetAddrInfoRequest {
             hash: query.hash(),
             cache: CacheConfig::default(),
             head: DNSLookup {
+                authorization,
                 // SAFETY: resolver is a live intrusive-RC m_ctx; init_ref bumps the embedded ref_count.
                 resolver: resolver.map(|r| unsafe { bun_ptr::IntrusiveRc::init_ref(r) }),
                 global_this: bun_ptr::BackRef::new(global_this),
@@ -1932,7 +1940,10 @@ impl<T: CAresRecordType> Drop for CAresLookup<T> {
 // DNSLookup
 // ──────────────────────────────────────────────────────────────────────────
 
+type LookupAuthorization = Option<(Box<[u8]>, u16)>;
+
 pub struct DNSLookup {
+    authorization: LookupAuthorization,
     pub resolver: Option<bun_ptr::IntrusiveRc<Resolver>>, // SHARED (intrusive — Resolver embeds ref_count and crosses FFI as m_ctx)
     pub global_this: bun_ptr::BackRef<JSGlobalObject>, // JSC_BORROW (BACKREF — JSGlobalObject outlives the request)
     pub promise: JSPromiseStrong,
@@ -1942,6 +1953,42 @@ pub struct DNSLookup {
 }
 
 impl DNSLookup {
+    fn authorize_result(
+        global: &JSGlobalObject,
+        result: JSValue,
+        host: &[u8],
+        port: u16,
+    ) -> JsResult<JSValue> {
+        let length = result.get_length(global)? as usize;
+        let output = JSValue::create_empty_array(global, length)?;
+        for index in 0..length {
+            let entry = result.get_index(global, index as u32)?;
+            let address = entry
+                .get(global, "address")?
+                .ok_or_else(|| global.throw(format_args!("Missing resolved address")))?;
+            let family = entry
+                .get(global, "family")?
+                .ok_or_else(|| global.throw(format_args!("Missing address family")))?;
+            let text = address.to_slice(global)?;
+            let token = crate::socket::socket_address::SocketAddress::resolved_endpoint(
+                global,
+                host,
+                text.slice(),
+                port,
+            )?;
+            let row = JSValue::create_empty_object(global, 3);
+            row.put(global, b"address", address);
+            row.put(global, b"family", family);
+            row.put(global, b"authorization", token);
+            output.put_index(global, index as u32, row)?;
+            token.ensure_still_alive();
+            row.ensure_still_alive();
+            result.ensure_still_alive();
+            output.ensure_still_alive();
+        }
+        Ok(output)
+    }
+
     /// Borrow the owning `JSGlobalObject`.
     ///
     /// SAFETY (encapsulated): `global_this` is assigned exactly once at
@@ -1955,13 +2002,18 @@ impl DNSLookup {
         self.global_this.get()
     }
 
-    pub(crate) fn init(resolver: *mut Resolver, global_this: &JSGlobalObject) -> *mut Self {
+    pub(crate) fn init(
+        resolver: *mut Resolver,
+        global_this: &JSGlobalObject,
+        authorization: LookupAuthorization,
+    ) -> *mut Self {
         bun_output::scoped_log!(DNSLookup, "init");
 
         let mut poll_ref = KeepAlive::init();
         poll_ref.ref_(js_event_loop_ctx());
 
         bun_core::heap::into_raw(Box::new(Self {
+            authorization,
             // SAFETY: resolver is a live intrusive-RC m_ctx; init_ref bumps the embedded ref_count.
             resolver: Some(unsafe { bun_ptr::IntrusiveRc::init_ref(resolver) }),
             global_this: bun_ptr::BackRef::new(global_this),
@@ -2070,7 +2122,21 @@ impl DNSLookup {
         unsafe {
             let mut promise = core::mem::take(&mut (*this).promise);
             let global_this = (*this).global_this();
-            let _ = promise.resolve_task(global_this, result); // TODO: properly propagate exception upwards
+            let resolved = if let Some((host, port)) = (*this).authorization.as_ref() {
+                Self::authorize_result(global_this, result, host, *port)
+            } else {
+                Ok(result)
+            };
+            match resolved {
+                Ok(result) => {
+                    let _ = promise.resolve_task(global_this, result);
+                }
+                Err(error) => {
+                    let exception = global_this.take_exception(error);
+                    let _ = promise.reject_task(global_this, exception);
+                }
+            }
+
             if let Some(resolver) = (*this).resolver.as_ref() {
                 // IntrusiveRc holds a live ref; request_completed mutates pending_requests counter only.
                 (*resolver.as_ptr()).request_completed();
@@ -3142,6 +3208,15 @@ pub mod internal {
     }
 
     pub fn prefetch(loop_: *mut Loop, hostname: Option<&ZStr>, port: u16) {
+        if hostname.is_some_and(|host| {
+            bun_permissions::check_network(
+                bun_permissions::NetworkOperation::Resolve,
+                bun_permissions::NetworkResource::Hostname(host.as_bytes()),
+            )
+            .is_err()
+        }) {
+            return;
+        }
         let _ = getaddrinfo(loop_, hostname, port, None);
     }
 
@@ -5083,6 +5158,14 @@ impl Resolver {
 
         let ip_slice = ip_str.to_slice_clone(global_this)?;
         let ip = ip_slice.slice();
+        if bun_permissions::check_network(
+            bun_permissions::NetworkOperation::Resolve,
+            bun_permissions::NetworkResource::Hostname(ip),
+        )
+        .is_err()
+        {
+            return Err(global_this.throw(format_args!("DNS network permission denied")));
+        }
         let channel: *mut c_ares::Channel = match self.get_channel() {
             ChannelResult::Result(res) => res,
             ChannelResult::Err(err) => {
@@ -5127,6 +5210,36 @@ impl Resolver {
     }
 
     // JSC-ABI shim emitted by `export_host_fn!` at module scope (see `global_resolve`).
+    pub(crate) fn lookup_for_connect(
+        global: &JSGlobalObject,
+        frame: &CallFrame,
+    ) -> JsResult<JSValue> {
+        if !bun_permissions::is_restricted(bun_permissions::Scope::Net) {
+            return Ok(JSValue::UNDEFINED);
+        }
+        let [hostname, port, options] = frame.arguments_as_array::<3>();
+        let name = hostname.to_slice(global)?;
+        let port = port.to_port_number(global)?;
+        bun_permissions::check_network(
+            bun_permissions::NetworkOperation::Connect,
+            bun_permissions::NetworkResource::Endpoint {
+                host: name.slice(),
+                port,
+            },
+        )
+        .map_err(|_| global.throw(format_args!("Network permission denied")))?;
+        let options = super::options_jsc::options_from_js(options, global).map_err(|_| {
+            global.throw_invalid_arguments(format_args!("Invalid connection DNS options"))
+        })?;
+        global_resolver(global).do_lookup_impl(
+            name.slice(),
+            port,
+            options,
+            global,
+            Some((name.slice().into(), port)),
+        )
+    }
+
     pub fn global_lookup(global_this: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
         let arguments = callframe.arguments_old::<2>();
         if arguments.len < 1 {
@@ -5192,6 +5305,25 @@ impl Resolver {
         options: GetAddrInfoOptions,
         global_this: &JSGlobalObject,
     ) -> JsResult<JSValue> {
+        self.do_lookup_impl(name, port, options, global_this, None)
+    }
+
+    fn do_lookup_impl(
+        &self,
+        name: &[u8],
+        port: u16,
+        options: GetAddrInfoOptions,
+        global_this: &JSGlobalObject,
+        authorization: LookupAuthorization,
+    ) -> JsResult<JSValue> {
+        if bun_permissions::check_network(
+            bun_permissions::NetworkOperation::Resolve,
+            bun_permissions::NetworkResource::Hostname(name),
+        )
+        .is_err()
+        {
+            return Err(global_this.throw(format_args!("DNS network permission denied")));
+        }
         // The system backends copy the hostname into a fixed `bun.PathBuffer` on the
         // stack before null-terminating it. Reject anything that cannot fit so we never
         // index past that buffer. RFC 1035 caps hostnames at 253 octets and NI_MAXHOST
@@ -5221,30 +5353,30 @@ impl Resolver {
 
         Ok(match opts.backend {
             GetAddrInfoBackend::CAres => {
-                self.c_ares_lookup_with_normalized_name(&query, global_this)?
+                self.c_ares_lookup_with_normalized_name(&query, global_this, authorization)?
             }
             GetAddrInfoBackend::Libc => {
                 #[cfg(windows)]
                 {
-                    lib_uv_backend::lookup(self, query, global_this)?
+                    lib_uv_backend::lookup(self, query, global_this, authorization)?
                 }
                 #[cfg(not(windows))]
                 {
-                    lib_c::lookup(self, &query, global_this)
+                    lib_c::lookup(self, &query, global_this, authorization)
                 }
             }
             GetAddrInfoBackend::System => {
                 #[cfg(target_os = "macos")]
                 {
-                    lib_info::lookup(self, &query, global_this)
+                    lib_info::lookup(self, &query, global_this, authorization)
                 }
                 #[cfg(windows)]
                 {
-                    lib_uv_backend::lookup(self, query, global_this)?
+                    lib_uv_backend::lookup(self, query, global_this, authorization)?
                 }
                 #[cfg(all(not(target_os = "macos"), not(windows)))]
                 {
-                    lib_c::lookup(self, &query, global_this)
+                    lib_c::lookup(self, &query, global_this, authorization)
                 }
             }
         })
@@ -5374,6 +5506,14 @@ impl Resolver {
         name: &[u8],
         global_this: &JSGlobalObject,
     ) -> JsResult<JSValue> {
+        if bun_permissions::check_network(
+            bun_permissions::NetworkOperation::Resolve,
+            bun_permissions::NetworkResource::Hostname(name),
+        )
+        .is_err()
+        {
+            return Err(global_this.throw(format_args!("DNS network permission denied")));
+        }
         let channel: *mut c_ares::Channel = match self.get_channel() {
             ChannelResult::Result(res) => res,
             ChannelResult::Err(err) => {
@@ -5428,6 +5568,7 @@ impl Resolver {
         &self,
         query: &GetAddrInfo,
         global_this: &JSGlobalObject,
+        authorization: LookupAuthorization,
     ) -> JsResult<JSValue> {
         let channel: *mut c_ares::Channel = match self.get_channel() {
             ChannelResult::Result(res) => res,
@@ -5454,7 +5595,7 @@ impl Resolver {
         let cache =
             self.get_or_put_into_pending_cache(&key, PendingCacheField::PendingHostCacheCares);
         if let CacheHit::Inflight(inflight) = cache {
-            let dns_lookup = DNSLookup::init(self.as_ctx_ptr(), global_this);
+            let dns_lookup = DNSLookup::init(self.as_ctx_ptr(), global_this, authorization);
             // SAFETY: `inflight` points into the resolver's pending-cache HiveArray slot.
             unsafe { (*inflight).append(dns_lookup) };
             // SAFETY: `dns_lookup` was just heap-allocated; owned by the inflight list.
@@ -5469,6 +5610,7 @@ impl Resolver {
             query,
             global_this,
             PendingCacheField::PendingHostCacheCares,
+            authorization,
         );
         // SAFETY: `request` just heap-allocated in `init()`; `tail` points at its inline `head`.
         let promise = unsafe { (*(*request).tail).promise.value() };
@@ -5788,6 +5930,24 @@ impl Resolver {
                     .to_bun_string(global_this)?,
             );
             let address_slice = address_string.to_owned_slice();
+            let server_port = if port == 0 {
+                53
+            } else {
+                u16::try_from(port).map_err(|_| {
+                    global_this.throw_invalid_arguments(format_args!("Invalid DNS server port"))
+                })?
+            };
+            if bun_permissions::check_network(
+                bun_permissions::NetworkOperation::Connect,
+                bun_permissions::NetworkResource::Endpoint {
+                    host: &address_slice,
+                    port: server_port,
+                },
+            )
+            .is_err()
+            {
+                return Err(global_this.throw(format_args!("DNS server network permission denied")));
+            }
 
             let mut address_buffer = vec![0u8; address_slice.len() + 1];
             let _ = strings::copy(&mut address_buffer, &address_slice);
@@ -5940,6 +6100,14 @@ impl Resolver {
         }
         let addr_slice = addr_str.to_slice(global_this);
         let addr_s = addr_slice.slice();
+        if bun_permissions::check_network(
+            bun_permissions::NetworkOperation::Resolve,
+            bun_permissions::NetworkResource::Hostname(addr_s),
+        )
+        .is_err()
+        {
+            return Err(global_this.throw(format_args!("DNS network permission denied")));
+        }
 
         let port_value = arguments.ptr[1];
         let port: u16 = port_value.to_port_number(global_this)?;

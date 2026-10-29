@@ -18,6 +18,39 @@ use crate::bun_fs::RealFS;
 // 2. (Optional) move the file to the destination
 // This saves us from allocating a buffer
 
+pub(crate) fn check_output_path(dir: Fd, path: &[u8]) -> Result<(), Error> {
+    use bun_permissions::{Scope, check_at_path};
+    if !check_at_path(Scope::FsWrite, dir, path, true)
+        || !check_at_path(Scope::FsWrite, dir, path, false)
+    {
+        return Err(bun_core::err!("AccessDenied"));
+    }
+    Ok(())
+}
+
+pub(crate) fn create_output_directory(dir: Fd, path: &[u8]) -> Result<(), Error> {
+    if bun_permissions::requires_path_check(bun_permissions::Scope::FsWrite) {
+        check_output_path(dir, path)?;
+        // Only missing prefixes can be created by make_path. Existing parents
+        // outside an exact output grant do not require write authority.
+        for (index, byte) in path.iter().enumerate() {
+            if index > 0 && (*byte == b'/' || (cfg!(windows) && *byte == b'\\')) {
+                let prefix = &path[..index];
+                let mut buffer = PathBuffer::uninit();
+                match bun_sys::fstatat(dir, resolve_path::z(prefix, &mut buffer)) {
+                    Ok(_) => {} // Existing ancestors are traversed, not created.
+                    Err(error) if error.get_errno() == bun_sys::E::ENOENT => {
+                        check_output_path(dir, prefix)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+    }
+    bun_sys::Dir::borrow(&dir).make_path(path)?;
+    Ok(())
+}
+
 pub struct OutputFile {
     pub loader: Loader,
     pub input_loader: Loader,
@@ -437,10 +470,12 @@ impl OutputFile {
                     // `dirname` returns `b""` when there's no separator.
                     let parent = resolve_path::dirname::<platform::Auto>(rel_path);
                     if !parent.is_empty() {
-                        bun_sys::Dir::borrow(&root_dir).make_path(parent)?;
+                        check_output_path(root_dir, rel_path)?;
+                        create_output_directory(root_dir, parent)?;
                     }
                 }
 
+                check_output_path(root_dir, rel_path)?;
                 let mut path_buf = PathBuffer::uninit();
                 let _ = bun_sys::write_file_with_path_buffer(
                     &mut path_buf,
@@ -468,6 +503,20 @@ impl OutputFile {
         let Value::Move(mv) = &self.value else {
             unreachable!()
         };
+        check_output_path(dir, rel_path)?;
+        if !bun_permissions::check_at_path(
+            bun_permissions::Scope::FsWrite,
+            mv.dir,
+            mv.get_pathname(),
+            true,
+        ) || !bun_permissions::check_at_path(
+            bun_permissions::Scope::FsRead,
+            mv.dir,
+            mv.get_pathname(),
+            false,
+        ) {
+            return Err(bun_core::err!("AccessDenied"));
+        }
         // NUL-terminate both paths into stack buffers via `resolve_path::z`.
         let mut src_buf = PathBuffer::uninit();
         let mut dst_buf = PathBuffer::uninit();
@@ -478,6 +527,10 @@ impl OutputFile {
     }
 
     pub fn copy_to(&self, _: &[u8], rel_path: &[u8], dir: Fd) -> Result<(), Error> {
+        check_output_path(dir, rel_path)?;
+        if !bun_permissions::check_path(bun_permissions::Scope::FsRead, self.src_path.text) {
+            return Err(bun_core::err!("AccessDenied"));
+        }
         let mut out_buf = PathBuffer::uninit();
         let fd_out = bun_sys::openat(
             dir,

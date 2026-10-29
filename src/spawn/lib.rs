@@ -274,6 +274,9 @@ pub struct RunResult {
 /// flattened to `KEY=VALUE\0`.
 #[cfg_attr(windows, allow(unreachable_code, unused_variables, unused_mut))]
 pub fn run(opts: RunOptions<'_>) -> core::result::Result<RunResult, bun_core::Error> {
+    if !bun_permissions::capability_allowed(bun_permissions::Capability::Subprocess) {
+        return Err(bun_core::err!("AccessDenied"));
+    }
     // Windows: `process::sync::spawn`
     // below is libuv-based on Windows and reads `options.windows.loop_` to get
     // the `uv_loop_t*`, but the only caller (`repository::exec`) runs on a

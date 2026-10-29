@@ -386,9 +386,22 @@ extern "C" void Bun__unlink(const char*, size_t);
 
 extern "C" void CrashHandler__setDlOpenAction(const char* action);
 extern "C" bool Bun__VM__allowAddons(void* vm);
+extern "C" bool Bun__Process__nativeCodeAllowed();
+extern "C" bool Bun__Process__systemAllowed();
+extern "C" bool Bun__Process__subprocessAllowed();
+
+static EncodedJSValue throwRestrictedProcessCapability(JSGlobalObject* globalObject)
+{
+    auto scope = DECLARE_THROW_SCOPE(JSC::getVM(globalObject));
+    throwException(globalObject, scope, createError(globalObject, "Process capability permission denied under a restricted policy"_s));
+    return {};
+}
 
 JSC_DEFINE_HOST_FUNCTION(Process_functionDlopen, (JSC::JSGlobalObject * globalObject_, JSC::CallFrame* callFrame))
 {
+    if (!Bun__Process__nativeCodeAllowed()) {
+        return throwRestrictedProcessCapability(globalObject_);
+    }
     Zig::GlobalObject* globalObject = static_cast<Zig::GlobalObject*>(globalObject_);
     auto callCountAtStart = globalObject->napiModuleRegisterCallCount;
     auto scope = DECLARE_THROW_SCOPE(JSC::getVM(globalObject));
@@ -790,6 +803,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionDlopen, (JSC::JSGlobalObject * globalOb
 
 JSC_DEFINE_HOST_FUNCTION(Process_functionUmask, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed() && callFrame->argumentCount() > 0 && !callFrame->argument(0).isUndefined()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     if (callFrame->argumentCount() == 0 || callFrame->argument(0).isUndefined()) {
         mode_t currentMask = umask(0);
         umask(currentMask);
@@ -985,6 +1001,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionHRTimeBigInt, (JSC::JSGlobalObject * gl
 
 JSC_DEFINE_HOST_FUNCTION(Process_functionChdir, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
 
@@ -1622,6 +1641,9 @@ JSC_DEFINE_HOST_FUNCTION(jsFunction_throwValue, (JSGlobalObject * globalObject, 
 
 JSC_DEFINE_HOST_FUNCTION(Process_functionAbort, (JSGlobalObject * globalObject, CallFrame*))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
 #if OS(WINDOWS)
     // Raising SIGABRT is handled in the CRT in windows, calling _exit() with ambiguous code "3" by default.
     // This adjustment to the abort behavior gives a more sane exit code on abort, by calling _exit directly with code 134.
@@ -1646,6 +1668,9 @@ static int persistStandardStream(int fd)
 
 JSC_DEFINE_HOST_FUNCTION(Process_functionExecve, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
 {
+    if (!Bun__Process__subprocessAllowed()) {
+        return throwRestrictedProcessCapability(lexicalGlobalObject);
+    }
     Zig::GlobalObject* globalObject = defaultGlobalObject(lexicalGlobalObject);
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
@@ -2449,6 +2474,9 @@ static JSValue constructReportObjectComplete(VM& vm, Zig::GlobalObject* globalOb
 
 JSC_DEFINE_HOST_FUNCTION(Process_functionGetReport, (JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     auto& vm = JSC::getVM(globalObject);
     // TODO: node:vm
     return JSValue::encode(constructReportObjectComplete(vm, uncheckedDowncast<Zig::GlobalObject>(globalObject), String()));
@@ -2456,6 +2484,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionGetReport, (JSGlobalObject * globalObje
 
 JSC_DEFINE_HOST_FUNCTION(Process_functionWriteReport, (JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
     // TODO:
@@ -3014,26 +3045,41 @@ static JSValue constructEnv(VM& vm, JSObject* processObject)
 
 JSC_DEFINE_HOST_FUNCTION(Process_functiongetuid, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     return JSValue::encode(jsNumber(getuid()));
 }
 
 JSC_DEFINE_HOST_FUNCTION(Process_functiongeteuid, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     return JSValue::encode(jsNumber(geteuid()));
 }
 
 JSC_DEFINE_HOST_FUNCTION(Process_functiongetegid, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     return JSValue::encode(jsNumber(getegid()));
 }
 
 JSC_DEFINE_HOST_FUNCTION(Process_functiongetgid, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     return JSValue::encode(jsNumber(getgid()));
 }
 
 JSC_DEFINE_HOST_FUNCTION(Process_functiongetgroups, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     auto& vm = JSC::getVM(globalObject);
     int ngroups = getgroups(0, nullptr);
     auto throwScope = DECLARE_THROW_SCOPE(vm);
@@ -3097,6 +3143,9 @@ static JSValue maybe_gid_by_name(JSC::ThrowScope& throwScope, JSGlobalObject* gl
 
 JSC_DEFINE_HOST_FUNCTION(Process_functionsetuid, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
     auto value = callFrame->argument(0);
@@ -3115,6 +3164,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionsetuid, (JSGlobalObject * globalObject,
 
 JSC_DEFINE_HOST_FUNCTION(Process_functionseteuid, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
     auto value = callFrame->argument(0);
@@ -3133,6 +3185,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionseteuid, (JSGlobalObject * globalObject
 
 JSC_DEFINE_HOST_FUNCTION(Process_functionsetegid, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
     auto value = callFrame->argument(0);
@@ -3151,6 +3206,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionsetegid, (JSGlobalObject * globalObject
 
 JSC_DEFINE_HOST_FUNCTION(Process_functionsetgid, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
     auto value = callFrame->argument(0);
@@ -3169,6 +3227,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionsetgid, (JSGlobalObject * globalObject,
 
 JSC_DEFINE_HOST_FUNCTION(Process_functionsetgroups, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
     auto groups = callFrame->argument(0);
@@ -3232,6 +3293,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionAssert, (JSGlobalObject * globalObject,
 extern "C" uint64_t Bun__Os__getFreeMemory(void);
 JSC_DEFINE_HOST_FUNCTION(Process_availableMemory, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     return JSValue::encode(jsNumber(Bun__Os__getFreeMemory()));
 }
 
@@ -3442,6 +3506,9 @@ static Process* getProcessObject(JSC::JSGlobalObject* lexicalGlobalObject, JSVal
 
 JSC_DEFINE_HOST_FUNCTION(Process_functionConstrainedMemory, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     return JSValue::encode(jsNumber(WTF::ramSize()));
 }
 
@@ -4203,6 +4270,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionCwd, (JSC::JSGlobalObject * globalObjec
 
 JSC_DEFINE_HOST_FUNCTION(Process_functionReallyKill, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     auto scope = DECLARE_THROW_SCOPE(JSC::getVM(globalObject));
 
     if (callFrame->argumentCount() < 2) {
@@ -4232,6 +4302,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionReallyKill, (JSC::JSGlobalObject * glob
 
 JSC_DEFINE_HOST_FUNCTION(Process_functionKill, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
 {
+    if (!Bun__Process__systemAllowed()) {
+        return throwRestrictedProcessCapability(globalObject);
+    }
     auto scope = DECLARE_THROW_SCOPE(JSC::getVM(globalObject));
     auto pid_value = callFrame->argument(0);
 

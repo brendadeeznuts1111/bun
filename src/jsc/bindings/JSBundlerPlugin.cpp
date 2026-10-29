@@ -39,6 +39,8 @@
 #include <dlfcn.h>
 #endif
 
+extern "C" bool Bun__Process__nativeCodeAllowed();
+
 namespace Bun {
 
 extern "C" void CrashHandler__setInsideNativePlugin(const char* plugin_name);
@@ -339,6 +341,11 @@ JSC_DEFINE_HOST_FUNCTION(jsBundlerPluginFunction_onBeforeParse, (JSC::JSGlobalOb
 {
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
+    if (!Bun__Process__nativeCodeAllowed()) {
+        throwException(globalObject, scope, createError(globalObject, "Native plugin permission denied under a restricted policy"_s));
+        return {};
+    }
+
     JSBundlerPlugin* thisObject = uncheckedDowncast<JSBundlerPlugin>(callFrame->thisValue());
     if (thisObject->plugin.tombstoned) {
         return JSC::JSValue::encode(JSC::jsUndefined());

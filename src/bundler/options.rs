@@ -2051,6 +2051,7 @@ pub mod bundle_options_defaults {
 }
 
 pub fn open_output_dir(output_dir: &[u8]) -> Result<Dir, bun_core::Error> {
+    crate::output_file::check_output_path(bun_sys::Fd::cwd(), output_dir)?;
     // Routed through `bun_sys` per CLAUDE.md (never `std::fs`).
     match bun_sys::open_dir_at(bun_sys::Fd::cwd(), output_dir) {
         Ok(d) => Ok(Dir::from_fd(d)),

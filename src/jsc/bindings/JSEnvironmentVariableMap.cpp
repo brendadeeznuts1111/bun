@@ -1,5 +1,6 @@
 #include "root.h"
 #include "ZigGlobalObject.h"
+#include "JSEnvironmentVariableMap.h"
 
 #include "helpers.h"
 
@@ -9,6 +10,8 @@
 #include <JavaScriptCore/JSArrayInlines.h>
 #include <JavaScriptCore/JSString.h>
 #include <JavaScriptCore/JSStringInlines.h>
+#include <JavaScriptCore/PropertyNameArray.h>
+#include <JavaScriptCore/PropertyDescriptor.h>
 
 #include "BunClientData.h"
 #include "wtf/Compiler.h"
@@ -23,10 +26,185 @@ extern "C" size_t Bun__getEnvKey(void* list, size_t index, unsigned char** out);
 extern "C" bool Bun__getEnvValue(JSGlobalObject* globalObject, const ZigString* name, ZigString* value);
 extern "C" bool Bun__getEnvValueBunString(JSGlobalObject* globalObject, const BunString* name, BunString* value);
 extern "C" void Bun__setEnvValue(JSGlobalObject* globalObject, const BunString* name, const BunString* value);
+extern "C" bool Bun__Process__permissionHas(const uint8_t*, size_t, const uint8_t*, size_t);
+extern "C" bool Bun__Process__environmentRestricted();
+#if OS(WINDOWS)
+extern "C" void Bun__Process__editWindowsEnvVar(BunString, BunString);
+#endif
 
 namespace Bun {
 
 using namespace WebCore;
+
+bool isEnvironmentVariableAllowed(const String& name)
+{
+    if (!Bun__Process__environmentRestricted()) return true;
+    auto bytes = name.utf8();
+    return Bun__Process__permissionHas(reinterpret_cast<const uint8_t*>("env"), 3,
+        reinterpret_cast<const uint8_t*>(bytes.data()), bytes.length());
+}
+
+class RestrictedEnvironment final : public JSNonFinalObject {
+public:
+    using Base = JSNonFinalObject;
+    static constexpr unsigned StructureFlags = Base::StructureFlags | OverridesGetOwnPropertySlot | OverridesGetOwnPropertyNames | OverridesPut | ProhibitsPropertyCaching | InterceptsGetOwnPropertySlotByIndexEvenWhenLengthIsNotZero;
+    DECLARE_INFO;
+
+    template<typename, SubspaceAccess mode> static GCClient::IsoSubspace* subspaceFor(VM& vm)
+    {
+        if constexpr (mode == SubspaceAccess::Concurrently)
+            return nullptr;
+        return WebCore::subspaceForImpl<RestrictedEnvironment, WebCore::UseCustomHeapCellType::No>(vm, [](auto& spaces) { return spaces.m_clientSubspaceForRestrictedEnvironment.get(); }, [](auto& spaces, auto&& space) { spaces.m_clientSubspaceForRestrictedEnvironment = std::forward<decltype(space)>(space); }, [](auto& spaces) { return spaces.m_subspaceForRestrictedEnvironment.get(); }, [](auto& spaces, auto&& space) { spaces.m_subspaceForRestrictedEnvironment = std::forward<decltype(space)>(space); });
+    }
+
+    static RestrictedEnvironment* create(VM& vm, JSGlobalObject* globalObject)
+    {
+        auto* structure = Structure::create(vm, globalObject, jsNull(), TypeInfo(ObjectType, StructureFlags), info());
+        auto* object = new (NotNull, allocateCell<RestrictedEnvironment>(vm)) RestrictedEnvironment(vm, structure);
+        object->finishCreation(vm);
+        return object;
+    }
+
+    static bool getOwnPropertySlot(JSObject* object, JSGlobalObject* globalObject, PropertyName name, PropertySlot& slot)
+    {
+        if (!allows(name)) return false;
+        return Base::getOwnPropertySlot(object, globalObject, normalize(globalObject->vm(), name), slot);
+    }
+
+    static bool getOwnPropertySlotByIndex(JSObject* object, JSGlobalObject* globalObject, unsigned index, PropertySlot& slot)
+    {
+        if (!allows(Identifier::from(globalObject->vm(), index))) return false;
+        return Base::getOwnPropertySlotByIndex(object, globalObject, index, slot);
+    }
+
+    static bool put(JSCell* cell, JSGlobalObject* globalObject, PropertyName name, JSValue value, PutPropertySlot& slot)
+    {
+        if (!allows(name)) return deny(globalObject);
+#if OS(WINDOWS)
+        auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
+        auto string = value.toWTFString(globalObject);
+        RETURN_IF_EXCEPTION(scope, false);
+        value = jsString(globalObject->vm(), string);
+#endif
+        bool result = Base::put(cell, globalObject, normalize(globalObject->vm(), name), value, slot);
+#if OS(WINDOWS)
+        RETURN_IF_EXCEPTION(scope, false);
+        if (result && !name.isPrivateName()) Bun__Process__editWindowsEnvVar(Bun::toString(name.publicName()), Bun::toString(string));
+#endif
+        return result;
+    }
+
+    static bool putByIndex(JSCell* cell, JSGlobalObject* globalObject, unsigned index, JSValue value, bool shouldThrow)
+    {
+        auto name = Identifier::from(globalObject->vm(), index);
+        if (!allows(name)) return deny(globalObject);
+#if OS(WINDOWS)
+        auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
+        auto string = value.toWTFString(globalObject);
+        RETURN_IF_EXCEPTION(scope, false);
+        value = jsString(globalObject->vm(), string);
+#endif
+        bool result = Base::putByIndex(cell, globalObject, index, value, shouldThrow);
+#if OS(WINDOWS)
+        RETURN_IF_EXCEPTION(scope, false);
+        if (result) Bun__Process__editWindowsEnvVar(Bun::toString(name.string()), Bun::toString(string));
+#endif
+        return result;
+    }
+
+    static bool deleteProperty(JSCell* cell, JSGlobalObject* globalObject, PropertyName name, DeletePropertySlot& slot)
+    {
+        if (!allows(name)) return deny(globalObject);
+        bool result = Base::deleteProperty(cell, globalObject, normalize(globalObject->vm(), name), slot);
+#if OS(WINDOWS)
+        if (result && !name.isPrivateName()) Bun__Process__editWindowsEnvVar(Bun::toString(name.publicName()), { .tag = BunStringTag::Dead });
+#endif
+        return result;
+    }
+
+    static bool deletePropertyByIndex(JSCell* cell, JSGlobalObject* globalObject, unsigned index)
+    {
+        auto name = Identifier::from(globalObject->vm(), index);
+        if (!allows(name)) return deny(globalObject);
+        bool result = Base::deletePropertyByIndex(cell, globalObject, index);
+#if OS(WINDOWS)
+        if (result) Bun__Process__editWindowsEnvVar(Bun::toString(name.string()), { .tag = BunStringTag::Dead });
+#endif
+        return result;
+    }
+
+    static bool defineOwnProperty(JSObject* object, JSGlobalObject* globalObject, PropertyName name, const PropertyDescriptor& descriptor, bool shouldThrow)
+    {
+        if (!allows(name)) return deny(globalObject);
+#if OS(WINDOWS)
+        auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
+        auto normalizedDescriptor = descriptor;
+        String string;
+        if (descriptor.value() && !name.isPrivateName()) {
+            string = descriptor.value().toWTFString(globalObject);
+            RETURN_IF_EXCEPTION(scope, false);
+            normalizedDescriptor.setValue(jsString(globalObject->vm(), string));
+        }
+        bool result = Base::defineOwnProperty(object, globalObject, normalize(globalObject->vm(), name), normalizedDescriptor, shouldThrow);
+        RETURN_IF_EXCEPTION(scope, false);
+        if (result && !string.isNull()) Bun__Process__editWindowsEnvVar(Bun::toString(name.publicName()), Bun::toString(string));
+        return result;
+#else
+        return Base::defineOwnProperty(object, globalObject, normalize(globalObject->vm(), name), descriptor, shouldThrow);
+#endif
+    }
+
+    static void getOwnPropertyNames(JSObject* object, JSGlobalObject* globalObject, PropertyNameArrayBuilder& names, DontEnumPropertiesMode mode)
+    {
+        auto& vm = globalObject->vm();
+        PropertyNameArrayBuilder candidates(vm, names.propertyNameMode(), names.privateSymbolMode());
+        Base::getOwnPropertyNames(object, globalObject, candidates, mode);
+        for (const auto& name : candidates) {
+            if (allows(name)) names.add(name);
+        }
+    }
+
+    static bool setPrototype(JSObject*, JSGlobalObject* globalObject, JSValue, bool)
+    {
+        return deny(globalObject);
+    }
+
+private:
+    RestrictedEnvironment(VM& vm, Structure* structure)
+        : Base(vm, structure)
+    {
+    }
+
+    static bool allows(PropertyName name)
+    {
+        return name.isPrivateName() || (!name.isSymbol() && isEnvironmentVariableAllowed(name.publicName()));
+    }
+
+    static Identifier normalize(VM& vm, PropertyName name)
+    {
+#if OS(WINDOWS)
+        if (!name.isSymbol()) return Identifier::fromString(vm, name.publicName().convertToASCIIUppercase());
+#endif
+        return Identifier::fromUid(vm, name.uid());
+    }
+
+    static bool deny(JSGlobalObject* globalObject)
+    {
+        auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
+        throwTypeError(globalObject, scope, "Environment permission denied"_s);
+        return false;
+    }
+};
+
+const ClassInfo RestrictedEnvironment::s_info = { "Environment"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(RestrictedEnvironment) };
+
+JSObject* createEnvironmentVariablesObject(Zig::GlobalObject* globalObject, size_t capacity)
+{
+    auto& vm = globalObject->vm();
+    if (Bun__Process__environmentRestricted()) return RestrictedEnvironment::create(vm, globalObject);
+    if (capacity < 63) return constructEmptyObject(globalObject, globalObject->objectPrototype(), capacity);
+    return constructEmptyObject(globalObject, globalObject->objectPrototype());
+}
 
 JSC_DEFINE_CUSTOM_GETTER(jsGetterEnvironmentVariable, (JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, PropertyName propertyName))
 {
@@ -48,6 +226,13 @@ JSC_DEFINE_CUSTOM_GETTER(jsGetterEnvironmentVariable, (JSGlobalObject * globalOb
     }
 
     JSValue result = jsString(vm, Zig::toStringCopy(value));
+#if OS(WINDOWS)
+    if (Bun__Process__environmentRestricted()) {
+        auto name = Identifier::fromString(vm, propertyName.publicName().convertToASCIIUppercase());
+        thisObject->putDirect(vm, name, result, 0);
+        return JSValue::encode(result);
+    }
+#endif
     thisObject->putDirect(vm, propertyName, result, 0);
     return JSValue::encode(result);
 }
@@ -351,12 +536,7 @@ JSValue createEnvironmentVariablesMap(Zig::GlobalObject* globalObject)
 
     void* list;
     size_t count = Bun__getEnvCount(globalObject, &list);
-    JSC::JSObject* object = nullptr;
-    if (count < 63) {
-        object = constructEmptyObject(globalObject, globalObject->objectPrototype(), count);
-    } else {
-        object = constructEmptyObject(globalObject, globalObject->objectPrototype());
-    }
+    JSC::JSObject* object = createEnvironmentVariablesObject(globalObject, count);
 
 #if OS(WINDOWS)
     JSArray* keyArray = constructEmptyArray(globalObject, nullptr, count);
@@ -409,6 +589,7 @@ JSValue createEnvironmentVariablesMap(Zig::GlobalObject* globalObject)
         size_t len = Bun__getEnvKey(list, i, &chars);
         // We can't really trust that the OS gives us valid UTF-8
         auto name = String::fromUTF8ReplacingInvalidSequences(std::span { chars, len });
+        if (!isEnvironmentVariableAllowed(name)) continue;
 #if OS(WINDOWS)
         keyArray->putByIndexInline(globalObject, (unsigned)i, jsString(vm, name), false);
 #endif
@@ -463,7 +644,7 @@ JSValue createEnvironmentVariablesMap(Zig::GlobalObject* globalObject)
     if (!hasTZ) {
         TZAttrs |= JSC::PropertyAttribute::DontEnum;
     }
-    object->putDirectCustomAccessor(
+    if (isEnvironmentVariableAllowed(TZ)) object->putDirectCustomAccessor(
         vm,
         Identifier::fromString(vm, TZ), JSC::CustomGetterSetter::create(vm, jsTimeZoneEnvironmentVariableGetter, jsTimeZoneEnvironmentVariableSetter), TZAttrs);
 
@@ -471,7 +652,7 @@ JSValue createEnvironmentVariablesMap(Zig::GlobalObject* globalObject)
     if (!hasNodeTLSRejectUnauthorized) {
         NODE_TLS_REJECT_UNAUTHORIZED_Attrs |= JSC::PropertyAttribute::DontEnum;
     }
-    object->putDirectCustomAccessor(
+    if (isEnvironmentVariableAllowed(NODE_TLS_REJECT_UNAUTHORIZED)) object->putDirectCustomAccessor(
         vm,
         Identifier::fromString(vm, NODE_TLS_REJECT_UNAUTHORIZED), JSC::CustomGetterSetter::create(vm, jsNodeTLSRejectUnauthorizedGetter, jsNodeTLSRejectUnauthorizedSetter), NODE_TLS_REJECT_UNAUTHORIZED_Attrs);
 
@@ -479,11 +660,12 @@ JSValue createEnvironmentVariablesMap(Zig::GlobalObject* globalObject)
     if (!hasBunConfigVerboseFetch) {
         BUN_CONFIG_VERBOSE_FETCH_Attrs |= JSC::PropertyAttribute::DontEnum;
     }
-    object->putDirectCustomAccessor(
+    if (isEnvironmentVariableAllowed(BUN_CONFIG_VERBOSE_FETCH)) object->putDirectCustomAccessor(
         vm,
         Identifier::fromString(vm, BUN_CONFIG_VERBOSE_FETCH), JSC::CustomGetterSetter::create(vm, jsBunConfigVerboseFetchGetter, jsBunConfigVerboseFetchSetter), BUN_CONFIG_VERBOSE_FETCH_Attrs);
 
     for (size_t j = 0; j < proxyVarCount; j++) {
+        if (!isEnvironmentVariableAllowed(String(proxyVarNames[j]))) continue;
         // Known limitation: `delete process.env.NO_PROXY` removes the accessor
         // without calling the setter, leaving the native env map stale (same as TZ).
         // Use `process.env.NO_PROXY = ""` to unset. DontDelete would throw in
@@ -500,6 +682,7 @@ JSValue createEnvironmentVariablesMap(Zig::GlobalObject* globalObject)
     }
 
 #if OS(WINDOWS)
+    if (Bun__Process__environmentRestricted()) return object;
     auto editWindowsEnvVar = JSC::JSFunction::create(vm, globalObject, 0, String("editWindowsEnvVar"_s), jsEditWindowsEnvVar, ImplementationVisibility::Public);
 
     JSC::JSFunction* getSourceEvent = JSC::JSFunction::create(vm, globalObject, processObjectInternalsWindowsEnvCodeGenerator(vm), globalObject);

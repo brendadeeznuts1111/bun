@@ -1092,6 +1092,13 @@ impl StatWatcher {
 
 // Shared by InitialStatTask::work_pool_callback and StatWatcher::restat — identical logic.
 fn restat_impl(path: &ZStr) -> bun_sys::Maybe<PosixStat> {
+    if !bun_permissions::check_path(bun_permissions::Scope::FsRead, path.as_bytes()) {
+        return Err(
+            bun_sys::Error::from_code(bun_sys::E::EACCES, bun_sys::Tag::stat)
+                .with_path(path.as_bytes()),
+        );
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         if bun_sys::SUPPORTS_STATX_ON_LINUX.load(Ordering::Relaxed) {

@@ -246,6 +246,10 @@ pub mod open {
     /// URL when the spawn fails or the opener exits non-zero (e.g. headless/CI
     /// environments).
     pub(crate) fn open_url(url: &[u8]) {
+        if !bun_permissions::capability_allowed(bun_permissions::Capability::Subprocess) {
+            fallback(url);
+            return;
+        }
         match bun_core::spawn_sync_inherit(&[OPENER, url]) {
             Ok(status) if status.is_ok() => {}
             _ => fallback(url),

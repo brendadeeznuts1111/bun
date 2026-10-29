@@ -38,6 +38,12 @@ pub mod kernel32 {
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        pub fn QueryDosDeviceW(
+            lpDeviceName: LPCWSTR,
+            lpTargetPath: *mut u16,
+            ucchMax: DWORD,
+        ) -> DWORD;
+
         // ── IOCP / async directory watching ──
         // safe: all args are by-value opaques (`HANDLE`/`ULONG_PTR`/`DWORD`);
         // a bad handle yields NULL + GetLastError, no UB.
@@ -4975,3 +4981,204 @@ pub fn getenv_w(name: &[u16]) -> Option<Vec<u16>> {
 bun_core::declare_scope!(windowsUserUniqueId, visible);
 
 // SetFilePointerEx referenced via the `pub use` at the top of this module.
+
+/// Reject path traversal that could contact an unauthorized remote filesystem.
+/// Callers must authorize the server of a direct UNC path before this check.
+/// Drive mappings are inspected without opening them; every filesystem component
+/// is then opened relative to its retained parent without following reparses.
+/// This is a conservative preflight, not protection against later OS path races.
+pub fn check_path_without_remote_reparse(path: &[u8]) -> crate::Maybe<()> {
+    use bun_windows_sys::externs as w;
+
+    fn denied() -> crate::Error {
+        crate::Error::from_code(crate::E::EACCES, crate::Tag::open)
+    }
+
+    struct PathHandle(w::HANDLE);
+    impl Drop for PathHandle {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from a successful NtCreateFile and is
+            // owned by this guard alone.
+            unsafe { w::CloseHandle(self.0) };
+        }
+    }
+
+    fn open_component(parent: w::HANDLE, name: &str) -> Result<PathHandle, w::NTSTATUS> {
+        let mut wide: Vec<u16> = name.encode_utf16().collect();
+        let byte_len = u16::try_from(wide.len() * 2).map_err(|_| w::NTSTATUS::INVALID_PARAMETER)?;
+        let mut object_name = w::UNICODE_STRING {
+            Length: byte_len,
+            MaximumLength: byte_len,
+            Buffer: wide.as_mut_ptr(),
+        };
+        let mut attributes = w::OBJECT_ATTRIBUTES {
+            Length: size_of::<w::OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent,
+            ObjectName: &mut object_name,
+            Attributes: 0x40, // OBJ_CASE_INSENSITIVE, matching Windows path lookup.
+            SecurityDescriptor: ptr::null_mut(),
+            SecurityQualityOfService: ptr::null_mut(),
+        };
+        let mut io: w::IO_STATUS_BLOCK = bun_core::ffi::zeroed();
+        let mut handle = ptr::null_mut();
+        // SAFETY: all out parameters and the counted UTF-16 name remain live
+        // for this synchronous open. The parent is retained by the caller.
+        let status = unsafe {
+            w::ntdll::NtCreateFile(
+                &mut handle,
+                w::FILE_READ_ATTRIBUTES | w::SYNCHRONIZE,
+                &mut attributes,
+                &mut io,
+                ptr::null_mut(),
+                w::FILE_ATTRIBUTE_NORMAL,
+                w::FILE_SHARE_READ | w::FILE_SHARE_WRITE,
+                w::FILE_OPEN,
+                w::FILE_SYNCHRONOUS_IO_NONALERT | w::FILE_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if status == w::NTSTATUS::SUCCESS {
+            Ok(PathHandle(handle))
+        } else {
+            Err(status)
+        }
+    }
+
+    fn is_directory_without_reparse(handle: &PathHandle) -> crate::Maybe<bool> {
+        let mut info: w::BY_HANDLE_FILE_INFORMATION = bun_core::ffi::zeroed();
+        // SAFETY: the owned live handle and writable output structure are valid.
+        if unsafe { w::GetFileInformationByHandle(handle.0, &mut info) } == 0
+            || info.dwFileAttributes & w::FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(denied());
+        }
+        Ok(info.dwFileAttributes & w::FILE_ATTRIBUTE_DIRECTORY != 0)
+    }
+
+    fn valid_component(component: &str) -> bool {
+        !component.is_empty()
+            && component != "."
+            && component != ".."
+            && !component.ends_with(['.', ' '])
+            && !component.contains([':', '\0', '*', '?'])
+    }
+
+    let path = core::str::from_utf8(path).map_err(|_| denied())?;
+    let normalized = path.replace('/', "\\");
+    // Only ordinary absolute drive paths and direct UNC paths are supported.
+    // Device namespaces and drive-relative paths fail closed.
+    let (root, tail) = if normalized.starts_with("\\\\") {
+        let mut components = normalized[2..].splitn(3, '\\');
+        let server = components.next().ok_or_else(denied)?;
+        let share = components.next().ok_or_else(denied)?;
+        if !valid_component(server) || !valid_component(share) {
+            return Err(denied());
+        }
+        (
+            format!("\\??\\UNC\\{server}\\{share}\\"),
+            components.next().unwrap_or(""),
+        )
+    } else {
+        let bytes = normalized.as_bytes();
+        if bytes.len() < 3
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || bytes[2] != b'\\'
+        {
+            return Err(denied());
+        }
+        let drive = [u16::from(bytes[0]), u16::from(b':'), 0];
+        let mut target = [0u16; 32768];
+        // SAFETY: drive is terminated and target has the advertised capacity.
+        let count = unsafe {
+            kernel32::QueryDosDeviceW(drive.as_ptr(), target.as_mut_ptr(), target.len() as u32)
+        } as usize;
+        if count == 0 || count > target.len() {
+            return Err(denied());
+        }
+        let end = target[..count]
+            .iter()
+            .position(|&unit| unit == 0)
+            .ok_or_else(denied)?;
+        let device = String::from_utf16(&target[..end]).map_err(|_| denied())?;
+        let volume = device
+            .strip_prefix("\\Device\\HarddiskVolume")
+            .ok_or_else(denied)?;
+        if volume.is_empty() || !volume.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(denied());
+        }
+        // Use the inspected NT device directly, without resolving the DOS
+        // drive mapping again when opening the root.
+        (format!("{device}\\"), &normalized[3..])
+    };
+    let components: Vec<_> = tail.trim_end_matches('\\').split('\\').collect();
+    if !tail.is_empty()
+        && components
+            .iter()
+            .any(|component| !valid_component(component))
+    {
+        return Err(denied());
+    }
+    let root_handle = open_component(ptr::null_mut(), &root).map_err(|_| denied())?;
+    if !is_directory_without_reparse(&root_handle)? {
+        return Err(denied());
+    }
+    let mut parents = vec![root_handle];
+    if tail.is_empty() {
+        return Ok(());
+    }
+    for (index, component) in components.iter().enumerate() {
+        let child = match open_component(parents.last().unwrap().0, component) {
+            Ok(child) => child,
+            Err(w::NTSTATUS::OBJECT_NAME_NOT_FOUND | w::NTSTATUS::OBJECT_PATH_NOT_FOUND) => {
+                return Ok(());
+            }
+            Err(_) => return Err(denied()),
+        };
+        let directory = is_directory_without_reparse(&child)?;
+        if index + 1 < components.len() && !directory {
+            return Err(denied());
+        }
+        parents.push(child);
+    }
+    Ok(())
+}
+
+/// Read the name recorded when a handle was opened, without asking Windows to
+/// normalize its filesystem path (which can traverse an SMB share). Callers
+/// still authorize the returned path before performing filesystem operations.
+pub fn get_fd_path_opened_only(fd: Fd, buffer: &mut PathBuffer) -> crate::Maybe<&[u8]> {
+    use bun_windows_sys::externs as w;
+    let denied = || crate::Error::from_code(crate::E::EACCES, crate::Tag::GetFinalPathNameByHandle);
+    if !fd.is_valid() {
+        return Err(denied());
+    }
+    let mut wide = bun_paths::w_path_buffer_pool::get();
+    // SAFETY: fd is borrowed, and the output buffer has the advertised capacity.
+    let length = unsafe {
+        w::GetFinalPathNameByHandleW(
+            fd.native(),
+            wide.0.as_mut_ptr(),
+            wide.0.len() as u32,
+            w::FILE_NAME_OPENED | w::VOLUME_NAME_DOS,
+        )
+    } as usize;
+    if length == 0 || length >= wide.0.len() {
+        return Err(denied());
+    }
+    // Decode before copying to make truncation and invalid UTF-16 fail closed.
+    let path = String::from_utf16(&wide.0[..length]).map_err(|_| denied())?;
+    let normalized = if let Some(tail) = path.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{tail}")
+    } else {
+        path.strip_prefix("\\\\?\\").unwrap_or(&path).to_owned()
+    };
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= buffer.0.len() || bytes.contains(&0) {
+        return Err(denied());
+    }
+    buffer.0[..bytes.len()].copy_from_slice(bytes);
+    buffer.0[bytes.len()] = 0;
+    Ok(&buffer.0[..bytes.len()])
+}

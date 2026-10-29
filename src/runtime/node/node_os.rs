@@ -207,6 +207,11 @@ mod _impl {
     }
 
     pub(crate) fn create_node_os_binding(global: &JSGlobalObject) -> JsResult<JSValue> {
+        if !bun_permissions::capability_allowed(bun_permissions::Capability::SystemInformation) {
+            return Err(global.throw(format_args!(
+                "System information permission denied under a restricted policy"
+            )));
+        }
         let obj = JSValue::create_empty_object(global, 14);
         // SAFETY: pure FFI getter
         obj.put(
@@ -730,6 +735,23 @@ mod _impl {
         // In Node.js, this is a wrapper around uv_os_homedir.
         #[cfg(windows)]
         {
+            if !bun_permissions::allows(bun_permissions::Scope::Env, b"USERPROFILE") {
+                let mut passwd: libuv::uv_passwd_t = bun_core::ffi::zeroed();
+                // SAFETY: passwd is a valid out-parameter; success initializes its strings.
+                if let Some(error) = unsafe { libuv::uv_os_get_passwd(&mut passwd) }
+                    .to_error(bun_sys::Tag::uv_os_homedir)
+                {
+                    return Err(global.throw_value(error.to_js(global)));
+                }
+                let passwd = scopeguard::guard(passwd, |mut passwd| {
+                    // SAFETY: this allocation was initialized by uv_os_get_passwd above.
+                    unsafe { libuv::uv_os_free_passwd(&mut passwd) };
+                });
+                // SAFETY: successful uv_os_get_passwd returns a live NUL-terminated home directory.
+                return Ok(BunString::clone_utf8(unsafe {
+                    bun_core::ffi::cstr(passwd.homedir).to_bytes()
+                }));
+            }
             let mut out = PathBuffer::uninit();
             let mut size: usize = out.len();
             // SAFETY: valid buffer + size out-param
@@ -744,7 +766,10 @@ mod _impl {
         {
             // The posix implementation of uv_os_homedir first checks the HOME
             // environment variable, then falls back to reading the passwd entry.
-            if let Some(home) = env_var::HOME.get() {
+            if let Some(home) = env_var::HOME
+                .get()
+                .filter(|_| bun_permissions::allows(bun_permissions::Scope::Env, b"HOME"))
+            {
                 if !home.is_empty() {
                     return Ok(BunString::init(home));
                 }
@@ -1464,6 +1489,11 @@ mod _impl {
     }
 
     pub(crate) fn set_priority1(global: &JSGlobalObject, pid: i32, priority: i32) -> JsResult<()> {
+        if !bun_permissions::capability_allowed(bun_permissions::Capability::ProcessControl) {
+            return Err(global.throw(format_args!(
+                "Process priority permission denied under a restricted policy"
+            )));
+        }
         let errcode = set_process_priority_impl(pid, priority);
         match errcode {
             bun_sys::E::ESRCH => {
@@ -1603,9 +1633,14 @@ mod _impl {
             result.put(
                 global_this,
                 b"username",
-                ZigString::init(env_var::USER.get().unwrap_or(b"unknown"))
-                    .with_encoding()
-                    .to_js(global_this),
+                ZigString::init(
+                    env_var::USER
+                        .get()
+                        .filter(|_| bun_permissions::allows(bun_permissions::Scope::Env, b"USER"))
+                        .unwrap_or(b"unknown"),
+                )
+                .with_encoding()
+                .to_js(global_this),
             );
             result.put(global_this, b"uid", JSValue::js_number(-1.0));
             result.put(global_this, b"gid", JSValue::js_number(-1.0));
@@ -1613,7 +1648,10 @@ mod _impl {
         }
         #[cfg(not(windows))]
         {
-            let username = env_var::USER.get().unwrap_or(b"unknown");
+            let username = env_var::USER
+                .get()
+                .filter(|_| bun_permissions::allows(bun_permissions::Scope::Env, b"USER"))
+                .unwrap_or(b"unknown");
 
             result.put(
                 global_this,
@@ -1623,9 +1661,14 @@ mod _impl {
             result.put(
                 global_this,
                 b"shell",
-                ZigString::init(env_var::SHELL.get().unwrap_or(b"unknown"))
-                    .with_encoding()
-                    .to_js(global_this),
+                ZigString::init(
+                    env_var::SHELL
+                        .get()
+                        .filter(|_| bun_permissions::allows(bun_permissions::Scope::Env, b"SHELL"))
+                        .unwrap_or(b"unknown"),
+                )
+                .with_encoding()
+                .to_js(global_this),
             );
             // `bun_sys::c::{getuid,getgid}` are declared `safe fn` (no args, never
             // fail) — discharges the per-site proof the raw `libc` re-export needed.

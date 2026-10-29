@@ -51,6 +51,8 @@
 #include "wtf/text/StringToIntegerConversion.h"
 #include <JavaScriptCore/InternalFieldTuple.h>
 #include "BunString.h"
+
+extern "C" bool Bun__Process__nativeCodeAllowed();
 static constexpr int32_t kSafeIntegersFlag = 1 << 1;
 static constexpr int32_t kStrictFlag = 1 << 2;
 
@@ -78,6 +80,7 @@ static inline int lazyLoadSQLite()
 }
 
 #endif
+#include "PermissionVFS.h"
 /* ******************************************************************************** */
 
 #if !USE(SYSTEM_MALLOC)
@@ -1155,6 +1158,10 @@ JSC_DEFINE_HOST_FUNCTION(jsSQLStatementSetCustomSQLite, (JSC::JSGlobalObject * l
 {
     auto& vm = JSC::getVM(lexicalGlobalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
+    if (!Bun__Process__nativeCodeAllowed()) {
+        throwException(lexicalGlobalObject, scope, createError(lexicalGlobalObject, "Native SQLite capability permission denied under a restricted policy"_s));
+        return {};
+    }
 
     JSValue thisValue = callFrame->thisValue();
     JSSQLStatementConstructor* thisObject = dynamicDowncast<JSSQLStatementConstructor>(thisValue.getObject());
@@ -1265,7 +1272,7 @@ JSC_DEFINE_HOST_FUNCTION(jsSQLStatementDeserialize, (JSC::JSGlobalObject * lexic
     }
 
     sqlite3* db = nullptr;
-    if (sqlite3_open_v2(":memory:", &db, openFlags, nullptr) != SQLITE_OK) {
+    if (Bun::SQLitePermissions::initialize() != SQLITE_OK || sqlite3_open_v2(":memory:", &db, openFlags, nullptr) != SQLITE_OK) {
         // Ownership of `data` is only transferred by sqlite3_deserialize below;
         // on open failure it must be released here. A failed open can still
         // return a partially-initialized handle that needs sqlite3_close().
@@ -1275,7 +1282,7 @@ JSC_DEFINE_HOST_FUNCTION(jsSQLStatementDeserialize, (JSC::JSGlobalObject * lexic
         return {};
     }
 
-    int status = sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 1, NULL);
+    int status = sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, Bun__Process__nativeCodeAllowed() ? 1 : 0, NULL);
     if (status != SQLITE_OK) {
         // TODO: log a warning here that we can't load extensions
     }
@@ -1294,7 +1301,7 @@ JSC_DEFINE_HOST_FUNCTION(jsSQLStatementDeserialize, (JSC::JSGlobalObject * lexic
     }
 
     if (status != SQLITE_OK) {
-        auto message = status == SQLITE_ERROR ? "unable to deserialize database"_s : sqliteString(sqlite3_errstr(status));
+        auto message = status == SQLITE_ERROR ? "unable to deserialize database"_s : WTF::String::fromUTF8(sqlite3_errstr(status));
         sqlite3_close(db);
         throwException(lexicalGlobalObject, scope, createError(lexicalGlobalObject, message));
         return {};
@@ -1350,6 +1357,10 @@ JSC_DEFINE_HOST_FUNCTION(jsSQLStatementLoadExtensionFunction, (JSC::JSGlobalObje
 {
     auto& vm = JSC::getVM(lexicalGlobalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
+    if (!Bun__Process__nativeCodeAllowed()) {
+        throwException(lexicalGlobalObject, scope, createError(lexicalGlobalObject, "Native SQLite capability permission denied under a restricted policy"_s));
+        return {};
+    }
 
     JSValue thisValue = callFrame->thisValue();
     JSSQLStatementConstructor* thisObject = dynamicDowncast<JSSQLStatementConstructor>(thisValue.getObject());
@@ -1741,17 +1752,25 @@ JSC_DEFINE_HOST_FUNCTION(jsSQLStatementOpenStatementFunction, (JSC::JSGlobalObje
 
     JSValue finalizationTarget = callFrame->argument(2);
 
+    if (Bun::SQLitePermissions::initialize() != SQLITE_OK) {
+        throwException(lexicalGlobalObject, scope, createError(lexicalGlobalObject, "Failed to initialize SQLite filesystem permission checks"_s));
+        return {};
+    }
     sqlite3* db = nullptr;
     int statusCode = sqlite3_open_v2(path.utf8().data(), &db, openFlags, nullptr);
 
     if (statusCode != SQLITE_OK) {
-        throwException(lexicalGlobalObject, scope, createSQLiteError(lexicalGlobalObject, db));
+        // Copy SQLite's error while the partial handle still owns its message.
+        auto error = createSQLiteError(lexicalGlobalObject, db);
+        if (db)
+            sqlite3_close(db);
+        throwException(lexicalGlobalObject, scope, error);
         return {};
     }
 
     sqlite3_extended_result_codes(db, 1);
 
-    int status = sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 1, NULL);
+    int status = sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, Bun__Process__nativeCodeAllowed() ? 1 : 0, NULL);
     if (status != SQLITE_OK) {
         // TODO: log a warning here that extensions are unsupported.
     }
@@ -1827,6 +1846,10 @@ JSC_DEFINE_HOST_FUNCTION(jsSQLStatementFcntlFunction, (JSC::JSGlobalObject * lex
 {
     auto& vm = JSC::getVM(lexicalGlobalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
+    if (!Bun__Process__nativeCodeAllowed()) {
+        throwException(lexicalGlobalObject, scope, createError(lexicalGlobalObject, "Native SQLite capability permission denied under a restricted policy"_s));
+        return {};
+    }
 
     JSValue thisValue = callFrame->thisValue();
     JSSQLStatementConstructor* thisObject = dynamicDowncast<JSSQLStatementConstructor>(thisValue.getObject());

@@ -450,7 +450,10 @@ impl<const SSL: bool> NewSocket<SSL> {
     /// Connect to `self.connection` (must be `Some`). Reads the field directly
     /// rather than taking it by-ref so the single caller in `connect_finish`
     /// doesn't need a disjoint borrow.
-    pub fn do_connect(&self) -> Result<(), bun_core::Error> {
+    pub fn do_connect(
+        &self,
+        authorization: Option<&bun_permissions::ResolvedNetworkEndpoint>,
+    ) -> Result<(), bun_core::Error> {
         // Keep `self` alive across the
         // re-entrant connect path. `ScopedRef` stores a raw `*mut Self` (no
         // borrow held across the body) and derefs on Drop.
@@ -508,7 +511,7 @@ impl<const SSL: bool> NewSocket<SSL> {
                     .as_ref()
                     .map(|(h, p)| (bun_core::ZBox::from_bytes(h), *p));
                 self.socket.set(
-                    match group.connect(
+                    match group.connect_authorized(
                         kind,
                         ssl_ctx,
                         host_c,
@@ -516,6 +519,7 @@ impl<const SSL: bool> NewSocket<SSL> {
                         local_z.as_ref().map(|(z, p)| (z.as_zstr().as_cstr(), *p)),
                         flags,
                         core::mem::size_of::<*mut c_void>() as c_int,
+                        authorization,
                     ) {
                         uws::ConnectResult::Failed => {
                             return Err(bun_core::err!("FailedToOpenSocket"));

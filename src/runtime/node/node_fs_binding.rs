@@ -5,9 +5,11 @@ use bun_jsc::call_frame::ArgumentsSlice;
 use bun_jsc::virtual_machine::VirtualMachine;
 use bun_jsc::{CallFrame, JSGlobalObject, JSPromise, JSValue, JsCell, JsResult, SysErrorJsc as _};
 
+use bun_jsc::Unprotect;
+
 use crate::node::fs::{
-    self, AsyncCpTask, AsyncReaddirRecursiveTask, Flavor, FsArgument, FsReturn, NodeFS,
-    NodeFSDispatch, NodeFSFunctionEnum, Op, args, async_, ret,
+    self, AsyncCpTask, AsyncReaddirRecursiveTask, CheckFsPermissions, Flavor, FsArgument, FsReturn,
+    NodeFS, NodeFSDispatch, NodeFSFunctionEnum, Op, args, async_, ret,
 };
 
 /// Signature of every generated NodeFS host function.
@@ -46,6 +48,9 @@ where
         return Ok(JSValue::ZERO);
     }
 
+    args.check_permissions(F)
+        .map_err(|err| global.throw_value(err.to_js(global)))?;
+
     // R-2: `JsCell::with_mut` scopes the `&mut NodeFS` to the blocking
     // syscall; `dispatch` never re-enters JS, and `Maybe<R>` is fully owned
     // (`sys::Error.path` is `Box<[u8]>`, not a borrow into `sync_error_buf`).
@@ -65,7 +70,7 @@ where
 /// Windows path picks `UVFSRequest` for a handful of fds-only ops while
 /// everything else uses `AsyncFSTask`, and that choice is encoded in the
 /// `async_::*` type aliases rather than derivable from `F` alone.
-fn run_async<A: FsArgument>(
+fn run_async<A: FsArgument, const F: NodeFSFunctionEnum>(
     this: &Binding,
     global: &JSGlobalObject,
     frame: &CallFrame,
@@ -98,6 +103,19 @@ fn run_async<A: FsArgument>(
         // SAFETY: not yet dropped; only drop site for this path.
         unsafe { ManuallyDrop::drop(&mut slice) };
         return Ok(JSValue::ZERO);
+    }
+
+    if let Err(err) = args.check_permissions(F) {
+        let value = err.to_js(global);
+        args.unprotect();
+        drop(args);
+        // SAFETY: no task has taken ownership of this argument slice.
+        unsafe { ManuallyDrop::drop(&mut slice) };
+        return Ok(
+            JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
+                global, value,
+            ),
+        );
     }
 
     if A::HAVE_ABORT_SIGNAL {
@@ -189,7 +207,7 @@ impl Binding {
         let mut slice = ManuallyDrop::new(ArgumentsSlice::init(vm, frame.arguments()));
         slice.will_be_async = true;
 
-        let cp_args = match args::Cp::from_js(global, &mut slice) {
+        let mut cp_args = match args::Cp::from_js(global, &mut slice) {
             Ok(a) => a,
             Err(err) => {
                 // SAFETY: not yet dropped; only drop site for this path.
@@ -203,6 +221,19 @@ impl Binding {
             // SAFETY: not yet dropped; only drop site for this path.
             unsafe { ManuallyDrop::drop(&mut slice) };
             return Ok(JSValue::ZERO);
+        }
+
+        if let Err(err) = fs::check_copy_permissions(&cp_args) {
+            let value = err.to_js(global);
+            cp_args.unprotect();
+            drop(cp_args);
+            // SAFETY: no task has taken ownership of this argument slice.
+            unsafe { ManuallyDrop::drop(&mut slice) };
+            return Ok(
+                JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
+                    global, value,
+                ),
+            );
         }
 
         // SAFETY: re-borrow `vm` mutably; the `slice` borrow is no longer used.
@@ -238,7 +269,7 @@ impl Binding {
         let mut slice = ManuallyDrop::new(ArgumentsSlice::init(vm, frame.arguments()));
         slice.will_be_async = true;
 
-        let rd_args = match args::Readdir::from_js(global, &mut slice) {
+        let mut rd_args = match args::Readdir::from_js(global, &mut slice) {
             Ok(a) => a,
             Err(err) => {
                 // SAFETY: not yet dropped; only drop site for this path.
@@ -252,6 +283,19 @@ impl Binding {
             // SAFETY: not yet dropped; only drop site for this path.
             unsafe { ManuallyDrop::drop(&mut slice) };
             return Ok(JSValue::ZERO);
+        }
+
+        if let Err(err) = rd_args.check_permissions(NodeFSFunctionEnum::Readdir) {
+            let value = err.to_js(global);
+            rd_args.unprotect();
+            drop(rd_args);
+            // SAFETY: no task has taken ownership of this argument slice.
+            unsafe { ManuallyDrop::drop(&mut slice) };
+            return Ok(
+                JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
+                    global, value,
+                ),
+            );
         }
 
         // SAFETY: re-borrow `vm` mutably; the `slice` borrow is no longer used.
@@ -348,7 +392,7 @@ macro_rules! node_fs_bindings {
                     global: &JSGlobalObject,
                     frame: &CallFrame,
                 ) -> JsResult<JSValue> {
-                    run_async::<$Args>(this, global, frame, async_::$F::create)
+                    run_async::<$Args, { NodeFSFunctionEnum::$F }>(this, global, frame, async_::$F::create)
                 }
             )*
         }

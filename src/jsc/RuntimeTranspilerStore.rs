@@ -83,7 +83,7 @@ pub(crate) fn dump_source_string_failiable(
     specifier: &[u8],
     written: &[u8],
 ) -> Result<(), bun_core::Error> {
-    if !cfg!(debug_assertions) {
+    if !cfg!(debug_assertions) || bun_permissions::is_restricted(bun_permissions::Scope::FsWrite) {
         return Ok(());
     }
     if bun_core::env_var::feature_flag::BUN_DEBUG_NO_DUMP

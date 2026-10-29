@@ -19,6 +19,7 @@ static JSC_DECLARE_HOST_FUNCTION(constructWebView);
 static JSC_DECLARE_HOST_FUNCTION(jsWebViewConstructorCloseAll);
 
 extern "C" void Bun__WebView__closeAllForTermination();
+extern "C" bool Bun__Process__subprocessAllowed();
 extern "C" size_t Bun__Feature__webview_chrome;
 extern "C" size_t Bun__Feature__webview_webkit;
 
@@ -100,6 +101,10 @@ JSC_DEFINE_HOST_FUNCTION(constructWebView, (JSGlobalObject * globalObject, CallF
 {
     VM& vm = globalObject->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
+    if (!Bun__Process__subprocessAllowed()) {
+        throwTypeError(globalObject, scope, "Subprocess permission denied for WebView"_s);
+        return {};
+    }
 
     auto* zigGlobalObject = defaultGlobalObject(globalObject);
 

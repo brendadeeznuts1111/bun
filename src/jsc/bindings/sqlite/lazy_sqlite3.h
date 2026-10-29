@@ -48,6 +48,9 @@ typedef int (*lazy_sqlite3_get_autocommit_type)(sqlite3*);
 typedef int (*lazy_sqlite3_total_changes_type)(sqlite3*);
 typedef int (*lazy_sqlite3_get_autocommit_type)(sqlite3*);
 typedef int (*lazy_sqlite3_config_type)(int, ...);
+typedef sqlite3_vfs* (*lazy_sqlite3_vfs_find_type)(const char*);
+typedef int (*lazy_sqlite3_vfs_register_type)(sqlite3_vfs*, int);
+typedef int (*lazy_sqlite3_vfs_unregister_type)(sqlite3_vfs*);
 typedef int (*lazy_sqlite3_open_v2_type)(const char* filename, /* Database filename (UTF-8) */ sqlite3** ppDb, /* OUT: SQLite db handle */ int flags, /* Flags */ const char* zVfs /* Name of VFS module to use */);
 typedef int (*lazy_sqlite3_prepare_v3_type)(sqlite3* db, /* Database handle */
     const char* zSql, /* SQL statement, UTF-8 encoded */
@@ -128,6 +131,9 @@ static lazy_sqlite3_finalize_type lazy_sqlite3_finalize;
 static lazy_sqlite3_free_type lazy_sqlite3_free;
 static lazy_sqlite3_get_autocommit_type lazy_sqlite3_get_autocommit;
 static lazy_sqlite3_open_v2_type lazy_sqlite3_open_v2;
+static lazy_sqlite3_vfs_find_type lazy_sqlite3_vfs_find;
+static lazy_sqlite3_vfs_register_type lazy_sqlite3_vfs_register;
+static lazy_sqlite3_vfs_unregister_type lazy_sqlite3_vfs_unregister;
 static lazy_sqlite3_prepare_v3_type lazy_sqlite3_prepare_v3;
 static lazy_sqlite3_prepare16_v3_type lazy_sqlite3_prepare16_v3;
 static lazy_sqlite3_reset_type lazy_sqlite3_reset;
@@ -179,6 +185,9 @@ static lazy_sqlite3_last_insert_rowid_type lazy_sqlite3_last_insert_rowid;
 #define sqlite3_free lazy_sqlite3_free
 #define sqlite3_get_autocommit lazy_sqlite3_get_autocommit
 #define sqlite3_open_v2 lazy_sqlite3_open_v2
+#define sqlite3_vfs_find lazy_sqlite3_vfs_find
+#define sqlite3_vfs_register lazy_sqlite3_vfs_register
+#define sqlite3_vfs_unregister lazy_sqlite3_vfs_unregister
 #define sqlite3_prepare_v3 lazy_sqlite3_prepare_v3
 #define sqlite3_prepare16_v3 lazy_sqlite3_prepare16_v3
 #define sqlite3_reset lazy_sqlite3_reset
@@ -238,6 +247,9 @@ static int lazyLoadSQLite()
     }
     lazy_sqlite3_open_v2 = (lazy_sqlite3_open_v2_type)dlsym(sqlite3_handle, "sqlite3_open_v2");
     if (!lazy_sqlite3_open_v2) return -1;
+    lazy_sqlite3_vfs_find = (lazy_sqlite3_vfs_find_type)dlsym(sqlite3_handle, "sqlite3_vfs_find");
+    lazy_sqlite3_vfs_register = (lazy_sqlite3_vfs_register_type)dlsym(sqlite3_handle, "sqlite3_vfs_register");
+    lazy_sqlite3_vfs_unregister = (lazy_sqlite3_vfs_unregister_type)dlsym(sqlite3_handle, "sqlite3_vfs_unregister");
     lazy_sqlite3_bind_blob = (lazy_sqlite3_bind_blob_type)dlsym(sqlite3_handle, "sqlite3_bind_blob");
     lazy_sqlite3_bind_double = (lazy_sqlite3_bind_double_type)dlsym(sqlite3_handle, "sqlite3_bind_double");
     lazy_sqlite3_bind_int = (lazy_sqlite3_bind_int_type)dlsym(sqlite3_handle, "sqlite3_bind_int");

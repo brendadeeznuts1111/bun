@@ -1,6 +1,6 @@
 /**
  * Small Inspector Protocol reporter for TestReporter/LifecycleReporter events.
- * Invoke it with the inspector unix socket address; it emits JSON on exit.
+ * Invoke it with the inspector unix socket address; it emits JSON on disconnect.
  */
 import type { JSC } from "../../../packages/bun-inspector-protocol/src/protocol/jsc";
 import { InspectorSession, connect } from "./junit-reporter.ts";
@@ -47,6 +47,7 @@ export class CustomTestReporter {
     session.send("TestReporter.enable");
     session.send("LifecycleReporter.enable");
     session.send("Console.enable");
+    session.send("Inspector.initialized");
   }
 
   private found(params: JSC.TestReporter.FoundEvent) {
@@ -109,11 +110,16 @@ if (import.meta.main) {
   if (!address) throw new Error("Usage: custom.test.reporter.ts <inspector-address>");
 
   const session = new InspectorSession();
-  const socket = await connect(address);
+  const disconnected = Promise.withResolvers<void>();
+  const connection = connect(address, disconnected.resolve);
+  process.send?.({ type: "inspector-listening" });
+  const socket = await connection;
   session.socket = socket;
   const framer = new SocketFramer(message => session.onMessage(message));
   session.framer = framer;
   socket.data = { onData: framer.onData.bind(framer) };
   const reporter = new CustomTestReporter(session);
-  process.on("exit", () => console.log(reporter.format()));
+  await disconnected.promise;
+  console.log(reporter.format());
+  process.disconnect?.();
 }

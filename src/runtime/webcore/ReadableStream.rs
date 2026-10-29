@@ -321,6 +321,9 @@ impl ReadableStream {
         blob: &Blob,
         recommended_chunk_size: webcore::blob::SizeType,
     ) -> JsResult<JSValue> {
+        webcore::blob::check_blob_permission(blob, bun_permissions::Scope::FsRead, true)
+            .map_err(|err| global_this.throw_value(err.to_js(global_this)))?;
+
         let Some(store) = blob.store.get() else {
             return ReadableStream::empty(global_this);
         };
@@ -389,6 +392,9 @@ impl ReadableStream {
         blob: &Blob,
         offset: usize,
     ) -> JsResult<JSValue> {
+        webcore::blob::check_blob_permission(blob, bun_permissions::Scope::FsRead, true)
+            .map_err(|err| global_this.throw_value(err.to_js(global_this)))?;
+
         let Some(store) = blob.store.get() else {
             return ReadableStream::empty(global_this);
         };

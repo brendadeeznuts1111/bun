@@ -45,6 +45,7 @@ const { isIPv4, isIPv6, isIP } = require("internal/net/isIP");
 const ArrayPrototypeIncludes = Array.prototype.includes;
 const ArrayPrototypeJoin = Array.prototype.join;
 const ArrayPrototypePush = Array.prototype.push;
+const ArrayPrototypeSort = Array.prototype.sort;
 const MathMax = Math.max;
 
 const { UV_ECANCELED, UV_ETIMEDOUT } = process.binding("uv");
@@ -106,7 +107,8 @@ function appendTlsKeylog(line: Buffer) {
 const SocketAddress = $zig("node_net_binding.zig", "SocketAddress");
 const BlockList = $zig("node_net_binding.zig", "BlockList");
 const newDetachedSocket = $newZigFunction("node_net_binding.zig", "newDetachedSocket", 1);
-const doConnect = $newZigFunction("node_net_binding.zig", "doConnect", 2);
+const doConnect = $newZigFunction("node_net_binding.zig", "doConnect", 3);
+const lookupForConnect = $newZigFunction("node_net_binding.zig", "lookupForConnect", 3);
 
 const addServerName = $newZigFunction("Listener.zig", "jsAddServerName", 3);
 const upgradeDuplexToTLS = $newZigFunction("runtime/socket/socket.zig", "jsUpgradeDuplexToTLS", 2);
@@ -1234,24 +1236,35 @@ function serverHandlersFor(server) {
   return ServerHandlersNoSNI;
 }
 
-function kConnectTcp(self, addressType, req, address, port) {
+function kConnectTcp(self, addressType, req, address, port, authorization?) {
   $debug("SocketHandle.kConnectTcp", addressType, address, port);
-  const promise = doConnect(self._handle, {
-    hostname: address,
-    port,
-    localAddress: req.localAddress || undefined,
-    localPort: req.localPort || undefined,
-    ipv6Only: addressType === 6,
-    // The native socket is always half-open: closing it on the peer's FIN
-    // would discard whatever is still buffered on the writable side. The
-    // stream layer implements allowHalfOpen=false (onSocketEnd ends the
-    // writable side, which flushes, sends FIN and destroys), matching Node
-    // where libuv sockets are half-open and the stream layer decides.
-    allowHalfOpen: true,
-    tls: req.tls,
-    data: { self, req },
-    socket: self[khandlers],
-  });
+  let promise: Promise<unknown>;
+  try {
+    promise = doConnect(
+      self._handle,
+      {
+        hostname: address,
+        port,
+        localAddress: req.localAddress || undefined,
+        localPort: req.localPort || undefined,
+        ipv6Only: addressType === 6,
+        // The native socket is always half-open: closing it on the peer's FIN
+        // would discard whatever is still buffered on the writable side. The
+        // stream layer implements allowHalfOpen=false (onSocketEnd ends the
+        // writable side, which flushes, sends FIN and destroys), matching Node
+        // where libuv sockets are half-open and the stream layer decides.
+        allowHalfOpen: true,
+        tls: req.tls,
+        data: { self, req },
+        socket: self[khandlers],
+      },
+      authorization,
+    );
+  } catch (error: unknown) {
+    // Native authorization can fail before a socket or promise exists.
+    // Return it through the ordinary connect failure path, including retries.
+    return { error };
+  }
   promise.catch(_reason => {
     // eat this so there's no unhandledRejection
     // we already catch this in connectError and error
@@ -1261,15 +1274,22 @@ function kConnectTcp(self, addressType, req, address, port) {
 
 function kConnectPipe(self, req, address) {
   $debug("SocketHandle.kConnectPipe");
-  const promise = doConnect(self._handle, {
-    hostname: address,
-    unix: address,
-    // Always half-open natively; see kConnect.
-    allowHalfOpen: true,
-    tls: req.tls,
-    data: { self, req },
-    socket: self[khandlers],
-  });
+  let promise: Promise<unknown>;
+  try {
+    promise = doConnect(self._handle, {
+      hostname: address,
+      unix: address,
+      // Always half-open natively; see kConnect.
+      allowHalfOpen: true,
+      tls: req.tls,
+      data: { self, req },
+      socket: self[khandlers],
+    });
+  } catch (error: unknown) {
+    // Native authorization can fail before a socket or promise exists.
+    // Return it through the ordinary connect failure path, including retries.
+    return { error };
+  }
   promise.catch(_reason => {
     // eat this so there's no unhandledRejection
     // we already catch this in connectError and error
@@ -1549,18 +1569,23 @@ Socket.prototype.connect = function connect(...args) {
       connection = socket;
     }
     if (fd) {
-      doConnect(this._handle, {
-        data: this,
-        fd: fd,
-        socket: SocketHandlers,
-        // Always half-open natively; see kConnect.
-        allowHalfOpen: true,
-      }).catch(error => {
+      const onConnectError = (error: unknown) => {
         if (!this.destroyed) {
           this.emit("error", error);
           this.emit("close", true);
         }
-      });
+      };
+      try {
+        doConnect(this._handle, {
+          data: this,
+          fd: fd,
+          socket: SocketHandlers,
+          // Always half-open natively; see kConnect.
+          allowHalfOpen: true,
+        }).catch(onConnectError);
+      } catch (error: unknown) {
+        process.nextTick(onConnectError, error);
+      }
     }
     this.pauseOnConnect = pauseOnConnect;
     if (pauseOnConnect) {
@@ -2466,7 +2491,51 @@ function lookupAndConnect(self, options) {
 
   $debug("connect: find host", host, addressType);
   $debug("connect: dns options", dnsopts);
-  const lookup = optionsLookup || dns.lookup;
+  const lookup =
+    optionsLookup ||
+    function lookupAuthorizedEndpoint(hostname, lookupOptions, callback) {
+      let request;
+      try {
+        request = lookupForConnect(hostname, port, {
+          family: lookupOptions.family,
+          flags: lookupOptions.hints,
+        });
+      } catch (error) {
+        process.nextTick(callback, error);
+        return;
+      }
+      if (request === undefined) {
+        return dns.lookup(hostname, lookupOptions, callback);
+      }
+      request.then(
+        function resolvedEndpoints(addresses) {
+          if (addresses.length === 0) {
+            callback($ERR_INVALID_IP_ADDRESS(hostname));
+            return;
+          }
+          const order = dns.getDefaultResultOrder();
+          if (order === "ipv4first") {
+            ArrayPrototypeSort.$call(addresses, (a, b) => a.family - b.family);
+          } else if (order === "ipv6first") {
+            ArrayPrototypeSort.$call(addresses, (a, b) => b.family - a.family);
+          }
+          if (lookupOptions.all) {
+            callback(null, addresses);
+          } else {
+            const { address, family, authorization } = addresses[0];
+            callback(null, address, family, authorization);
+          }
+        },
+        function rejectLookup(error) {
+          if (error.code?.startsWith("DNS_")) error.code = error.code.slice(4);
+          if (error.syscall === "getaddrinfo" && !error.hostname) {
+            error.hostname = hostname;
+            error.message = `getaddrinfo ${error.code} ${hostname}`;
+          }
+          callback(error);
+        },
+      );
+    };
 
   if (dnsopts.family !== 4 && dnsopts.family !== 6 && !localAddress && autoSelectFamily) {
     $debug("connect: autodetecting", host, port);
@@ -2486,7 +2555,7 @@ function lookupAndConnect(self, options) {
     return;
   }
 
-  lookup(host, dnsopts, function emitLookup(err, ip, addressType) {
+  lookup(host, dnsopts, function emitLookup(err, ip, addressType, authorization) {
     self.emit("lookup", err, ip, addressType, host);
     if (!self.connecting) return;
     if (err) {
@@ -2499,7 +2568,7 @@ function lookupAndConnect(self, options) {
       process.nextTick(destroyNT, self, err);
     } else {
       self._unrefTimer();
-      internalConnect(self, options, ip, port, addressType, localAddress, localPort);
+      internalConnect(self, options, ip, port, addressType, localAddress, localPort, undefined, authorization);
     }
   });
 }
@@ -2573,10 +2642,10 @@ function lookupAndConnectMultiple(self, lookup, host, options, dnsopts, port, lo
 
     if (toAttempt.length === 1) {
       $debug("connect/multiple: only one address found, switching back to single connection");
-      const { address: ip, family: addressType } = toAttempt[0];
+      const { address: ip, family: addressType, authorization } = toAttempt[0];
 
       self._unrefTimer();
-      internalConnect(self, options, ip, port, addressType, localAddress, localPort);
+      internalConnect(self, options, ip, port, addressType, localAddress, localPort, undefined, authorization);
 
       return;
     }
@@ -2602,7 +2671,7 @@ function lookupAndConnectMultiple(self, lookup, host, options, dnsopts, port, lo
 }
 
 function internalConnect(self, options, path);
-function internalConnect(self, options, address, port, addressType, localAddress, localPort, _flags?) {
+function internalConnect(self, options, address, port, addressType, localAddress, localPort, _flags?, authorization?) {
   $assert(self.connecting);
 
   let err;
@@ -2688,7 +2757,7 @@ function internalConnect(self, options, address, port, addressType, localAddress
     req.addressType = addressType;
     req.tls = tls;
 
-    err = kConnectTcp(self, addressType, req, address, port);
+    err = kConnectTcp(self, addressType, req, address, port, authorization);
     // kConnectTcp returns 0 (not undefined) on the async-connect path, so the
     // perf context must be established whenever the attempt was dispatched
     // without a synchronous error — matching the `if (err)` failure check
@@ -2711,7 +2780,7 @@ function internalConnect(self, options, address, port, addressType, localAddress
   }
 
   if (err) {
-    const ex = new ExceptionWithHostPort(err, "connect", address, port);
+    const ex = typeof err === "object" ? err.error : new ExceptionWithHostPort(err, "connect", address, port);
     self.destroy(ex);
   }
 }
@@ -2745,7 +2814,7 @@ function internalConnectMultiple(context, canceled?) {
   }
 
   const { localPort, port, _flags } = context;
-  const { address, family: addressType } = context.addresses[current];
+  const { address, family: addressType, authorization } = context.addresses[current];
   let localAddress;
   let err;
 
@@ -2837,10 +2906,10 @@ function internalConnectMultiple(context, canceled?) {
 
   ArrayPrototypePush.$call(self.autoSelectFamilyAttemptedAddresses, `${address}:${port}`);
 
-  err = kConnectTcp(self, addressType, req, address, port);
+  err = kConnectTcp(self, addressType, req, address, port, authorization);
 
   if (err) {
-    const ex = new ExceptionWithHostPort(err, "connect", address, port);
+    const ex = typeof err === "object" ? err.error : new ExceptionWithHostPort(err, "connect", address, port);
     ArrayPrototypePush.$call(context.errors, ex);
 
     self.emit("connectionAttemptFailed", address, port, addressType, ex);

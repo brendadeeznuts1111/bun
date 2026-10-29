@@ -1,0 +1,16 @@
+[package]
+name = "bun_permissions"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bun_core.workspace = true
+bun_sys.workspace = true
+bun_paths.workspace = true
+

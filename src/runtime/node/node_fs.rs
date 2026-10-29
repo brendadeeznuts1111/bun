@@ -375,15 +375,95 @@ fn with_path_like(err: sys::Error, p: &PathOrFileDescriptor) -> sys::Error {
 }
 
 /// Gate path-based filesystem operations when the experimental permission
-/// model is enabled. File-descriptor operations are already authorized by the
-/// caller that opened the descriptor and therefore bypass path checks.
+/// model is enabled. Descriptor authorization is checked separately.
 #[inline]
 fn check_path_permission(scope: &[u8], path: &[u8], syscall: sys::Tag) -> Maybe<()> {
-    if crate::node::process::permission_allowed(scope, path) {
+    let scope = match scope {
+        b"fs.read" => bun_permissions::Scope::FsRead,
+        b"fs.write" => bun_permissions::Scope::FsWrite,
+        _ => return Err(sys::Error::from_code(E::EACCES, syscall).with_path(path)),
+    };
+    if bun_permissions::check_path(scope, path) {
         Ok(())
     } else {
         Err(sys::Error::from_code(E::EACCES, syscall).with_path(path))
     }
+}
+
+fn check_entry_permission(
+    scope: bun_permissions::Scope,
+    path: &[u8],
+    syscall: sys::Tag,
+) -> Maybe<()> {
+    if bun_permissions::check_entry(scope, path) {
+        Ok(())
+    } else {
+        Err(sys::Error::from_code(E::EACCES, syscall).with_path(path))
+    }
+}
+
+fn check_os_path_permission(
+    scope: bun_permissions::Scope,
+    path: &OSPathSliceZ,
+    entry: bool,
+) -> Maybe<()> {
+    if !bun_permissions::requires_path_check(scope) {
+        return Ok(());
+    }
+    let path_string = BunString::create_from_os_path(&path[..]);
+    let bytes = path_string.to_owned_slice();
+    let allowed = if entry {
+        bun_permissions::check_entry(scope, &bytes)
+    } else {
+        bun_permissions::check_path(scope, &bytes)
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(sys::Error::from_code(E::EACCES, sys::Tag::open).with_path(&bytes))
+    }
+}
+
+fn check_copy_os_paths(src: &OSPathSliceZ, dest: &OSPathSliceZ) -> Maybe<()> {
+    check_os_path_permission(bun_permissions::Scope::FsRead, src, true)?;
+    check_os_path_permission(bun_permissions::Scope::FsRead, src, false)?;
+    check_os_path_permission(bun_permissions::Scope::FsWrite, dest, true)?;
+    check_os_path_permission(bun_permissions::Scope::FsWrite, dest, false)
+}
+
+fn check_at_permission(
+    scope: bun_permissions::Scope,
+    fd: FD,
+    path: &[u8],
+    entry: bool,
+) -> Maybe<()> {
+    if bun_permissions::check_at_path(scope, fd, path, entry) {
+        Ok(())
+    } else {
+        Err(sys::Error::from_code(E::EACCES, sys::Tag::open).with_path(path))
+    }
+}
+
+fn check_symlink_permissions(target: &[u8], destination: &[u8]) -> Maybe<()> {
+    check_entry_permission(
+        bun_permissions::Scope::FsWrite,
+        destination,
+        sys::Tag::symlink,
+    )?;
+    if !bun_permissions::requires_path_check(bun_permissions::Scope::FsRead) {
+        return Ok(());
+    }
+    if bun_paths::is_absolute(target) {
+        return check_path_permission(b"fs.read", target, sys::Tag::symlink);
+    }
+    // Preserve raw components: the permission policy rejects parent traversal,
+    // and resolves existing parents before matching the grant.
+    let parent = bun_paths::dirname(destination).unwrap_or(b".");
+    let mut candidate = Vec::with_capacity(parent.len() + target.len() + 1);
+    candidate.extend_from_slice(parent);
+    candidate.push(bun_paths::SEP);
+    candidate.extend_from_slice(target);
+    check_path_permission(b"fs.read", &candidate, sys::Tag::symlink)
 }
 
 fn check_open_permission(path: &[u8], flags: i32) -> Maybe<()> {
@@ -400,6 +480,7 @@ fn check_open_permission(path: &[u8], flags: i32) -> Maybe<()> {
     }
     if writes {
         check_path_permission(b"fs.write", path, sys::Tag::open)?;
+        check_entry_permission(bun_permissions::Scope::FsWrite, path, sys::Tag::open)?;
     }
     Ok(())
 }
@@ -458,6 +539,8 @@ type PathInt = u32;
 #[cfg(not(windows))]
 #[inline]
 fn mkdir_os_path(path: &OSPathSliceZ, mode: Mode) -> Maybe<()> {
+    check_os_path_permission(bun_permissions::Scope::FsWrite, path, true)?;
+    check_os_path_permission(bun_permissions::Scope::FsWrite, path, false)?;
     Syscall::mkdir(path, mode)
 }
 #[cfg(not(windows))]
@@ -468,6 +551,8 @@ fn openat_os_path(dirfd: FD, path: &OSPathSliceZ, flags: i32, mode: Mode) -> May
 #[cfg(windows)]
 #[inline]
 fn mkdir_os_path(path: &OSPathSliceZ, mode: Mode) -> Maybe<()> {
+    check_os_path_permission(bun_permissions::Scope::FsWrite, path, true)?;
+    check_os_path_permission(bun_permissions::Scope::FsWrite, path, false)?;
     let _ = mode;
     sys::mkdir_w(path)
 }
@@ -1054,7 +1139,7 @@ mod _async_tasks {
     /// any borrowed JS-backed slices so the work-pool callback may run off-thread).
     /// The trait methods are **required** so missing impls are a compile error rather
     /// than a silent UAF/leak.
-    pub trait FsArgument: Sized + Unprotect {
+    pub trait FsArgument: Sized + Unprotect + super::CheckFsPermissions {
         const HAVE_ABORT_SIGNAL: bool = false;
         /// `Arguments.fromJS(ctx, &slice)` — parse this argument set from a JS
         /// call frame. Every `args::*` struct already exposes an inherent
@@ -2031,8 +2116,14 @@ mod _async_tasks {
             let src = unsafe { OSPathSliceZ::from_raw(src_buf.as_ptr(), src_dir_len as usize) };
             // SAFETY: dest_buf[dest_dir_len] == 0 written by caller
             let dest = unsafe { OSPathSliceZ::from_raw(dest_buf.as_ptr(), dest_dir_len as usize) };
+            if let Err(err) = check_copy_os_paths(src, dest) {
+                this_ref.finish_concurrently(Err(err));
+                return false;
+            }
 
             #[cfg(target_os = "macos")]
+            if !bun_permissions::requires_path_check(bun_permissions::Scope::FsRead)
+                && !bun_permissions::requires_path_check(bun_permissions::Scope::FsWrite)
             {
                 if let Some(err) = Maybe::<ret::Cp>::errno_sys_p(
                     bun_sys::c::clonefile_rc(src, dest, 0),
@@ -2752,6 +2843,285 @@ pub use _async_tasks::{
     IntoResultListEntry, NewAsyncCpTask, ResultListEntry, ResultListEntryValue, ShellAsyncCpTask,
     UVFSRequest, async_,
 };
+
+/// Authorization runs on the JS thread before either thread-pool or libuv
+/// dispatch. Keep this required so a newly added argument type cannot silently
+/// gain filesystem authority.
+pub trait CheckFsPermissions {
+    fn check_permissions(&self, operation: NodeFSFunctionEnum) -> Maybe<()>;
+}
+
+fn check_descriptor_permission(scope: bun_permissions::Scope, fd: FD, transfer: bool) -> Maybe<()> {
+    let standard_transfer = transfer
+        && fd.is_valid()
+        && match scope {
+            bun_permissions::Scope::FsRead => matches!(fd.stdio_tag(), Some(bun_sys::Stdio::StdIn)),
+            bun_permissions::Scope::FsWrite => matches!(
+                fd.stdio_tag(),
+                Some(bun_sys::Stdio::StdOut | bun_sys::Stdio::StdErr)
+            ),
+            _ => false,
+        };
+    if standard_transfer || bun_permissions::check_fd(scope, fd) {
+        Ok(())
+    } else {
+        Err(sys::Error::from_code(E::EACCES, sys::Tag::open).with_fd(fd))
+    }
+}
+
+fn check_path_or_descriptor(
+    scope: bun_permissions::Scope,
+    value: &PathOrFileDescriptor,
+    transfer: bool,
+) -> Maybe<()> {
+    match value {
+        PathOrFileDescriptor::Path(path) => check_path_permission(
+            match scope {
+                bun_permissions::Scope::FsRead => b"fs.read",
+                _ => b"fs.write",
+            },
+            path.slice(),
+            sys::Tag::open,
+        ),
+        PathOrFileDescriptor::Fd(fd) => check_descriptor_permission(scope, *fd, transfer),
+    }
+}
+
+macro_rules! check_path_arguments {
+    ($scope:expr; $( $ty:ty => $field:ident ),+ $(,)?) => {$(
+        impl CheckFsPermissions for $ty {
+            fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+                check_path_permission($scope, self.$field.slice(), sys::Tag::open)
+            }
+        }
+    )+};
+}
+check_path_arguments!(b"fs.read";
+    args::StatFS => path, args::Realpath => path);
+macro_rules! check_metadata_arguments {
+    ($($ty:ty, $entry_operation:ident, $scope:expr, $scope_name:expr),+ $(,)?) => {$(
+        impl CheckFsPermissions for $ty {
+            fn check_permissions(&self, operation: NodeFSFunctionEnum) -> Maybe<()> {
+                if operation == NodeFSFunctionEnum::$entry_operation {
+                    check_entry_permission($scope, self.path.slice(), sys::Tag::lstat)
+                } else {
+                    check_path_permission($scope_name, self.path.slice(), sys::Tag::stat)
+                }
+            }
+        }
+    )+};
+}
+check_metadata_arguments!(
+    args::Stat,
+    Lstat,
+    bun_permissions::Scope::FsRead,
+    b"fs.read",
+    args::Chown,
+    Lchown,
+    bun_permissions::Scope::FsWrite,
+    b"fs.write",
+    args::Chmod,
+    Lchmod,
+    bun_permissions::Scope::FsWrite,
+    b"fs.write",
+    args::Lutimes,
+    Lutimes,
+    bun_permissions::Scope::FsWrite,
+    b"fs.write"
+);
+impl CheckFsPermissions for args::Readlink {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        check_entry_permission(
+            bun_permissions::Scope::FsRead,
+            self.path.slice(),
+            sys::Tag::readlink,
+        )
+    }
+}
+impl CheckFsPermissions for args::Unlink {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        check_entry_permission(
+            bun_permissions::Scope::FsWrite,
+            self.path.slice(),
+            sys::Tag::unlink,
+        )
+    }
+}
+
+macro_rules! check_fd_arguments {
+    ($scope:expr, $transfer:expr; $( $ty:ty ),+ $(,)?) => {$(
+        impl CheckFsPermissions for $ty {
+            fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+                check_descriptor_permission($scope, self.fd, $transfer)
+            }
+        }
+    )+};
+}
+check_fd_arguments!(bun_permissions::Scope::FsRead, false; args::Fstat);
+check_fd_arguments!(bun_permissions::Scope::FsWrite, false;
+    args::FTruncate, args::Fchown, args::FChmod, args::Futimes, args::FdataSync, args::Fsync);
+check_fd_arguments!(bun_permissions::Scope::FsRead, true; args::Read);
+check_fd_arguments!(bun_permissions::Scope::FsWrite, true; args::Write);
+
+impl CheckFsPermissions for args::Close {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        Ok(())
+    }
+}
+impl CheckFsPermissions for args::FdVectorIo {
+    fn check_permissions(&self, operation: NodeFSFunctionEnum) -> Maybe<()> {
+        let scope = match operation {
+            NodeFSFunctionEnum::Readv => bun_permissions::Scope::FsRead,
+            NodeFSFunctionEnum::Writev => bun_permissions::Scope::FsWrite,
+            _ => return Err(sys::Error::from_code(E::EACCES, sys::Tag::open)),
+        };
+        check_descriptor_permission(scope, self.fd, true)
+    }
+}
+impl CheckFsPermissions for args::Truncate {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        check_path_or_descriptor(bun_permissions::Scope::FsWrite, &self.path, false)
+    }
+}
+impl CheckFsPermissions for args::Open {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        check_open_permission(self.path.slice(), self.flags.as_int())
+    }
+}
+impl CheckFsPermissions for args::ReadFile {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        check_path_or_descriptor(bun_permissions::Scope::FsRead, &self.path, true)?;
+        if let PathOrFileDescriptor::Path(path) = &self.path {
+            check_open_permission(path.slice(), self.flag.as_int())?;
+        }
+        Ok(())
+    }
+}
+impl CheckFsPermissions for args::WriteFile {
+    fn check_permissions(&self, operation: NodeFSFunctionEnum) -> Maybe<()> {
+        check_path_or_descriptor(bun_permissions::Scope::FsWrite, &self.file, true)?;
+        if let PathOrFileDescriptor::Path(path) = &self.file {
+            check_open_permission(
+                path.slice(),
+                if operation == NodeFSFunctionEnum::AppendFile {
+                    FileSystemFlags::A.as_int()
+                } else {
+                    self.flag.as_int()
+                },
+            )?;
+        }
+        Ok(())
+    }
+}
+impl CheckFsPermissions for args::Exists {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        if let Some(path) = &self.path {
+            check_path_permission(b"fs.read", path.slice(), sys::Tag::access)?;
+        }
+        Ok(())
+    }
+}
+impl CheckFsPermissions for args::Access {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        check_path_permission(b"fs.read", self.path.slice(), sys::Tag::access)?;
+        if self.mode.as_int() & 2 != 0 {
+            check_path_permission(b"fs.write", self.path.slice(), sys::Tag::access)?;
+        }
+        Ok(())
+    }
+}
+impl CheckFsPermissions for args::Rename {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        check_entry_permission(
+            bun_permissions::Scope::FsWrite,
+            self.old_path.slice(),
+            sys::Tag::rename,
+        )?;
+        check_entry_permission(
+            bun_permissions::Scope::FsWrite,
+            self.new_path.slice(),
+            sys::Tag::rename,
+        )
+    }
+}
+impl CheckFsPermissions for args::Link {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        check_entry_permission(
+            bun_permissions::Scope::FsRead,
+            self.old_path.slice(),
+            sys::Tag::link,
+        )?;
+        check_entry_permission(
+            bun_permissions::Scope::FsWrite,
+            self.old_path.slice(),
+            sys::Tag::link,
+        )?;
+        check_entry_permission(
+            bun_permissions::Scope::FsWrite,
+            self.new_path.slice(),
+            sys::Tag::link,
+        )
+    }
+}
+impl CheckFsPermissions for args::Symlink {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        check_symlink_permissions(self.target_path.slice(), self.new_path.slice())
+    }
+}
+impl CheckFsPermissions for args::CopyFile {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        check_path_permission(b"fs.read", self.src.slice(), sys::Tag::copyfile)?;
+        check_entry_permission(
+            bun_permissions::Scope::FsWrite,
+            self.dest.slice(),
+            sys::Tag::copyfile,
+        )?;
+        check_path_permission(b"fs.write", self.dest.slice(), sys::Tag::copyfile)
+    }
+}
+impl CheckFsPermissions for args::Readdir {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        check_path_permission(b"fs.read", self.path.slice(), sys::Tag::scandir)?;
+        Ok(())
+    }
+}
+impl CheckFsPermissions for args::RmDir {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        check_entry_permission(
+            bun_permissions::Scope::FsWrite,
+            self.path.slice(),
+            sys::Tag::rmdir,
+        )?;
+        Ok(())
+    }
+}
+impl CheckFsPermissions for args::Mkdir {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        check_entry_permission(
+            bun_permissions::Scope::FsWrite,
+            self.path.slice(),
+            sys::Tag::mkdir,
+        )?;
+        Ok(())
+    }
+}
+impl CheckFsPermissions for args::MkdirTemp {
+    fn check_permissions(&self, _: NodeFSFunctionEnum) -> Maybe<()> {
+        // The generated suffix must not turn an exact-file grant into a prefix grant.
+        let parent = bun_paths::dirname(self.prefix.slice()).unwrap_or(b".");
+        check_path_permission(b"fs.write", parent, sys::Tag::mkdir)
+    }
+}
+
+pub(crate) fn check_copy_permissions(args: &args::Cp) -> Maybe<()> {
+    check_path_permission(b"fs.read", args.src.slice(), sys::Tag::copyfile)?;
+    check_entry_permission(
+        bun_permissions::Scope::FsWrite,
+        args.dest.slice(),
+        sys::Tag::copyfile,
+    )?;
+    check_path_permission(b"fs.write", args.dest.slice(), sys::Tag::copyfile)
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // Arguments
@@ -5783,6 +6153,7 @@ impl NodeFS {
     }
 
     pub fn mkdir_recursive(&mut self, args: &args::Mkdir) -> Maybe<ret::Mkdir> {
+        args.check_permissions(NodeFSFunctionEnum::Mkdir)?;
         self.mkdir_recursive_impl::<()>(args, &())
     }
 
@@ -6603,6 +6974,12 @@ impl NodeFS {
         } else {
             async_task.root_fd
         };
+        check_at_permission(
+            bun_permissions::Scope::FsRead,
+            atfd,
+            basename.as_bytes(),
+            false,
+        )?;
         #[cfg(not(windows))]
         let open_res = Syscall::openat(atfd, basename, flags, 0);
         #[cfg(windows)]
@@ -6821,6 +7198,12 @@ impl NodeFS {
                 // item was stored with trailing NUL (see push site).
                 ZStr::from_slice_with_nul(&item)
             };
+            check_at_permission(
+                bun_permissions::Scope::FsRead,
+                atfd,
+                basename_z.as_bytes(),
+                false,
+            )?;
             let fd = match Syscall::openat(atfd, basename_z, flags, 0) {
                 Err(err) => {
                     if *root_fd == FD::INVALID {
@@ -7080,6 +7463,7 @@ impl NodeFS {
         flavor: Flavor,
         string_type: ReadFileStringType,
     ) -> Maybe<ret::ReadFileWithOptions> {
+        args.check_permissions(NodeFSFunctionEnum::ReadFile)?;
         if let PathOrFileDescriptor::Path(path) = &args.path {
             check_path_permission(b"fs.read", path.slice(), sys::Tag::open)?;
             check_open_permission(path.slice(), args.flag.as_int())?;
@@ -7440,6 +7824,16 @@ impl NodeFS {
         pathbuf: &mut PathBuffer,
         args: &args::WriteFile,
     ) -> Maybe<ret::WriteFile> {
+        args.check_permissions(NodeFSFunctionEnum::WriteFile)?;
+        // Relative paths with a non-cwd directory descriptor need a separate
+        // descriptor-relative authorization contract.
+        if bun_permissions::requires_path_check(bun_permissions::Scope::FsWrite)
+            && args.dirfd != FD::cwd()
+            && matches!(&args.file, PathOrFileDescriptor::Path(path) if !bun_paths::is_absolute(path.slice()))
+        {
+            return Err(sys::Error::from_code(E::EACCES, sys::Tag::open));
+        }
+
         let fd = match &args.file {
             PathOrFileDescriptor::Path(p) => {
                 let path = p.slice_z_with_force_copy::<true>(pathbuf);
@@ -8094,6 +8488,7 @@ impl NodeFS {
     }
 
     pub fn watch_file(&mut self, args: args::WatchFile, flavor: Flavor) -> Maybe<ret::WatchFile> {
+        check_path_permission(b"fs.read", args.path.slice(), sys::Tag::stat)?;
         debug_assert!(flavor == Flavor::Sync);
         // `create_stat_watcher` consumes `args` (the `PathLike` is moved into
         // the new `StatWatcher`); capture what the error path needs first.
@@ -8205,6 +8600,7 @@ impl NodeFS {
     }
 
     pub fn watch(&mut self, args: &args::Watch<'_>, _: Flavor) -> Maybe<ret::Watch> {
+        check_path_permission(b"fs.read", args.path.slice(), sys::Tag::stat)?;
         match args.create_fs_watcher() {
             // SAFETY: `create_fs_watcher` returns a freshly-heap-allocated
             // `*mut FSWatcher` whose ownership is held by the JS wrapper
@@ -8217,6 +8613,7 @@ impl NodeFS {
     /// This function is `cpSync`, but only if you pass `{ recursive: ..., force: ..., errorOnExist: ..., mode: ... }'
     /// The other options like `filter` use a JS fallback, see `src/js/internal/fs/cp.ts`
     pub fn cp(&mut self, args: &args::Cp, _: Flavor) -> Maybe<ret::Cp> {
+        check_copy_permissions(args)?;
         let mut src_buf = OSPathBuffer::uninit();
         let mut dest_buf = OSPathBuffer::uninit();
         let name_too_long = |path: &PathLike| sys::Error {
@@ -8301,6 +8698,8 @@ impl NodeFS {
         // SAFETY: see `src` above.
         let dest = unsafe { OSPathSliceZ::from_raw(dest_buf.as_ptr(), dd) };
 
+        check_copy_os_paths(src, dest)?;
+
         #[cfg(windows)]
         {
             let attributes = unsafe { sys::c::GetFileAttributesW(src.as_ptr()) };
@@ -8373,6 +8772,12 @@ impl NodeFS {
 
         #[cfg(target_os = "macos")]
         'try_with_clonefile: {
+            if bun_permissions::requires_path_check(bun_permissions::Scope::FsRead)
+                || bun_permissions::requires_path_check(bun_permissions::Scope::FsWrite)
+            {
+                break 'try_with_clonefile;
+            }
+
             if let Some(err) = Maybe::<ret::Cp>::errno_sys_p(
                 bun_sys::c::clonefile_rc(src, dest, 0),
                 sys::Tag::clonefile,
@@ -8536,6 +8941,7 @@ impl NodeFS {
         // SAFETY: NUL written at `target_buf[link_len]`.
         let link_target = ZStr::from_buf(&target_buf[..], link_len);
         if paths::is_absolute(link_target.as_bytes()) {
+            check_symlink_permissions(link_target.as_bytes(), dest.as_bytes())?;
             return Syscall::symlink(link_target, dest);
         }
         let mut cwd_buf = PathBuffer::uninit();
@@ -8544,6 +8950,7 @@ impl NodeFS {
         let Ok(cwd_len) = sys::getcwd(&mut cwd_buf[..]) else {
             // If we can't resolve cwd, preserve the link target as-is rather
             // than pointing the copied link back at the source path.
+            check_symlink_permissions(link_target.as_bytes(), dest.as_bytes())?;
             return Syscall::symlink(link_target, dest);
         };
         let cwd = &cwd_buf[..cwd_len];
@@ -8566,6 +8973,7 @@ impl NodeFS {
         let resolved_len = resolved.len();
         resolved_buf[resolved_len] = 0;
         // SAFETY: NUL written at `resolved_buf[resolved_len]`.
+        check_symlink_permissions(&resolved_buf[..resolved_len], dest.as_bytes())?;
         Syscall::symlink(ZStr::from_buf(&resolved_buf[..], resolved_len), dest)
     }
 
@@ -8580,6 +8988,7 @@ impl NodeFS {
         #[cfg(not(windows))] reuse_stat: Option<&sys::Stat>,
         args: &args::Cp,
     ) -> Maybe<ret::CopyFile> {
+        check_copy_os_paths(src, dest)?;
         let _ = args; // only the Windows branch consults `args` (shouldIgnoreEbusy)
 
         // TODO: do we need to fchown?
@@ -9223,7 +9632,9 @@ impl NodeFS {
     ) -> Maybe<R>
     where
         Op<{ F }>: NodeFSDispatch<R, A>,
+        A: CheckFsPermissions,
     {
+        args.check_permissions(F)?;
         <Op<{ F }> as NodeFSDispatch<R, A>>::run(self, args, flavor)
     }
 
@@ -9700,6 +10111,8 @@ fn dt_err(errno: E) -> bun_core::Error {
 
 #[inline]
 fn dt_open_dir(parent: &sys::Dir, name: &[u8]) -> Result<sys::Dir, E> {
+    check_at_permission(bun_permissions::Scope::FsWrite, parent.fd, name, false)
+        .map_err(|err| err.get_errno())?;
     let mut path_buf = PathBuffer::uninit();
     let len = name.len().min(path_buf.len() - 1);
     path_buf[..len].copy_from_slice(&name[..len]);
@@ -9719,6 +10132,8 @@ fn dt_open_dir(parent: &sys::Dir, name: &[u8]) -> Result<sys::Dir, E> {
 
 #[inline]
 fn dt_delete_file(parent: &sys::Dir, name: &[u8]) -> Result<(), E> {
+    check_at_permission(bun_permissions::Scope::FsWrite, parent.fd, name, true)
+        .map_err(|err| err.get_errno())?;
     let mut path_buf = PathBuffer::uninit();
     let len = name.len().min(path_buf.len() - 1);
     path_buf[..len].copy_from_slice(&name[..len]);
@@ -9759,6 +10174,8 @@ fn dt_delete_file(parent: &sys::Dir, name: &[u8]) -> Result<(), E> {
 
 #[inline]
 fn dt_delete_dir(parent: &sys::Dir, name: &[u8]) -> Result<(), E> {
+    check_at_permission(bun_permissions::Scope::FsWrite, parent.fd, name, true)
+        .map_err(|err| err.get_errno())?;
     let mut path_buf = PathBuffer::uninit();
     let len = name.len().min(path_buf.len() - 1);
     path_buf[..len].copy_from_slice(&name[..len]);

@@ -27,6 +27,58 @@ use crate::webcore::node_types::{PathOrBlob, PathOrFileDescriptor};
 use crate::webcore::s3_stub as S3;
 use crate::webcore::{self, Lifetime, ReadableStream, Request, Response, streams};
 
+/// Check the resource at operation time: Bun.file is a lazy reference and
+/// may also be used as a write-only destination.
+pub(crate) fn check_file_permission(
+    scope: bun_permissions::Scope,
+    path: &PathOrFileDescriptor,
+    transfer: bool,
+) -> bun_sys::Maybe<()> {
+    let allowed = match path {
+        PathOrFileDescriptor::Path(path) => {
+            bun_permissions::check_path(scope, path.slice())
+                && (scope != bun_permissions::Scope::FsWrite
+                    || bun_permissions::check_entry(scope, path.slice()))
+        }
+        PathOrFileDescriptor::Fd(fd) => {
+            let standard_transfer = transfer
+                && fd.is_valid()
+                && match scope {
+                    bun_permissions::Scope::FsRead => {
+                        matches!(fd.stdio_tag(), Some(bun_sys::Stdio::StdIn))
+                    }
+                    bun_permissions::Scope::FsWrite => matches!(
+                        fd.stdio_tag(),
+                        Some(bun_sys::Stdio::StdOut | bun_sys::Stdio::StdErr)
+                    ),
+                    _ => false,
+                };
+            standard_transfer || bun_permissions::check_fd(scope, *fd)
+        }
+    };
+    if allowed {
+        return Ok(());
+    }
+    let error = bun_sys::Error::from_code(bun_sys::E::EACCES, bun_sys::Tag::open);
+    Err(match path {
+        PathOrFileDescriptor::Path(path) => error.with_path(path.slice()),
+        PathOrFileDescriptor::Fd(fd) => error.with_fd(*fd),
+    })
+}
+
+pub(crate) fn check_blob_permission(
+    blob: &Blob,
+    scope: bun_permissions::Scope,
+    transfer: bool,
+) -> bun_sys::Maybe<()> {
+    if let Some(store) = blob.store.get() {
+        if let store::Data::File(file) = &store.data {
+            check_file_permission(scope, &file.pathlike, transfer)?;
+        }
+    }
+    Ok(())
+}
+
 bun_core::define_scoped_log!(debug, Blob, visible);
 
 /// `bunVM().transpiler.env.getHttpProxy(true, null, null)?.href` as an owned
@@ -446,6 +498,12 @@ impl BlobExt for Blob {
     }
 
     fn do_read_file<F: read_file::ReadFileToJs>(&self, global: &JSGlobalObject) -> JSValue {
+        if let Err(err) = check_blob_permission(self, bun_permissions::Scope::FsRead, true) {
+            return JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
+                global,
+                err.to_js(global),
+            );
+        }
         debug!("doReadFile");
 
         type Handler<'a, F> = read_file::NewReadFileHandler<'a, F>;
@@ -680,6 +738,14 @@ impl BlobExt for Blob {
         ctx: *mut C,
         global: &JSGlobalObject,
     ) {
+        if let Err(err) = check_blob_permission(self, bun_permissions::Scope::FsRead, true) {
+            F::call(
+                ctx,
+                read_file::ReadFileResultType::Err(err.to_system_error().into()),
+            );
+            return;
+        }
+
         #[cfg(windows)]
         {
             return read_file::ReadFileUV::start_with_ctx(
@@ -1177,6 +1243,8 @@ impl BlobExt for Blob {
         Ok(())
     }
     fn get_stream(&self, global_this: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
+        check_blob_permission(self, bun_permissions::Scope::FsRead, true)
+            .map_err(|err| global_this.throw_value(err.to_js(global_this)))?;
         let this_value = callframe.this();
         if let Some(cached) = bun_jsc::generated::JSBlob::stream_get_cached(this_value) {
             return Ok(cached);
@@ -1282,6 +1350,9 @@ impl BlobExt for Blob {
     }
 
     fn get_exists_sync(&self) -> JSValue {
+        if check_blob_permission(self, bun_permissions::Scope::FsRead, false).is_err() {
+            return JSValue::FALSE;
+        }
         if self.size.get() == MAX_SIZE {
             self.resolve_size();
         }
@@ -1303,6 +1374,8 @@ impl BlobExt for Blob {
         JSValue::from(bun_sys::S::ISREG(file.mode) || bun_sys::S::ISFIFO(file.mode))
     }
     fn do_write(&self, global_this: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
+        check_blob_permission(self, bun_permissions::Scope::FsWrite, true)
+            .map_err(|err| global_this.throw_value(err.to_js(global_this)))?;
         let arguments = callframe.arguments_old::<3>();
         // SAFETY: bun_vm() never returns null for a Bun-owned global.
         let mut args = jsc::ArgumentsSlice::init(global_this.bun_vm(), arguments.slice());
@@ -1383,6 +1456,22 @@ impl BlobExt for Blob {
     }
 
     fn do_unlink(&self, global_this: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
+        if let Some(store) = self.store.get() {
+            if let store::Data::File(file) = &store.data {
+                let allowed = match &file.pathlike {
+                    PathOrFileDescriptor::Path(path) => {
+                        bun_permissions::check_entry(bun_permissions::Scope::FsWrite, path.slice())
+                    }
+                    PathOrFileDescriptor::Fd(fd) => {
+                        bun_permissions::check_fd(bun_permissions::Scope::FsWrite, *fd)
+                    }
+                };
+                if !allowed {
+                    let err = bun_sys::Error::from_code(bun_sys::E::EACCES, bun_sys::Tag::unlink);
+                    return Err(global_this.throw_value(err.to_js(global_this)));
+                }
+            }
+        }
         let arguments = callframe.arguments_old::<1>();
         // SAFETY: bun_vm() never returns null for a Bun-owned global.
         let mut args = jsc::ArgumentsSlice::init(global_this.bun_vm(), arguments.slice());
@@ -1399,6 +1488,8 @@ impl BlobExt for Blob {
 
     // This mostly means 'can it be read?'
     fn get_exists(&self, global_this: &JSGlobalObject, _: &CallFrame) -> JsResult<JSValue> {
+        check_blob_permission(self, bun_permissions::Scope::FsRead, false)
+            .map_err(|err| global_this.throw_value(err.to_js(global_this)))?;
         if self.is_s3() {
             return crate::webcore::s3_file::S3BlobStatTask::exists(global_this, self);
         }
@@ -1413,6 +1504,8 @@ impl BlobExt for Blob {
         readable_stream: ReadableStream,
         extra_options: Option<JSValue>,
     ) -> JsResult<JSValue> {
+        check_blob_permission(self, bun_permissions::Scope::FsWrite, true)
+            .map_err(|err| global_this.throw_value(err.to_js(global_this)))?;
         let Some(store) = self.store.get().clone() else {
             return Ok(
                 JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
@@ -1728,6 +1821,8 @@ impl BlobExt for Blob {
     }
 
     fn get_writer(&self, global_this: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
+        check_blob_permission(self, bun_permissions::Scope::FsWrite, true)
+            .map_err(|err| global_this.throw_value(err.to_js(global_this)))?;
         let arguments_ = callframe.arguments_old::<1>();
         // Index the fixed-size buffer (`arguments.ptr[0]`), not the
         // len-bounded view, so the slot reads `.zero` when no arg was passed
@@ -2212,7 +2307,11 @@ impl BlobExt for Blob {
     }
 
     // TODO: Move this to a separate `File` object or BunFile
-    fn get_last_modified(&self, _: &JSGlobalObject) -> JSValue {
+    fn get_last_modified(&self, global: &JSGlobalObject) -> JSValue {
+        if let Err(err) = check_blob_permission(self, bun_permissions::Scope::FsRead, false) {
+            let _ = global.throw_value(err.to_js(global));
+            return JSValue::ZERO;
+        }
         if let Some(store) = self.store.get() {
             if matches!(store.data, store::Data::File(_)) {
                 // do not hold a pattern-bound `&File` across
@@ -2260,6 +2359,8 @@ impl BlobExt for Blob {
         self.size.get()
     }
     fn get_stat(&self, global_this: &JSGlobalObject, callback: &CallFrame) -> JsResult<JSValue> {
+        check_blob_permission(self, bun_permissions::Scope::FsRead, false)
+            .map_err(|err| global_this.throw_value(err.to_js(global_this)))?;
         // TODO: make this async for files
         let tag = match self.store.get() {
             None => return Ok(JSValue::UNDEFINED),
@@ -2321,7 +2422,11 @@ impl BlobExt for Blob {
         }
     }
 
-    fn get_size(&self, _: &JSGlobalObject) -> JSValue {
+    fn get_size(&self, global: &JSGlobalObject) -> JSValue {
+        if let Err(err) = check_blob_permission(self, bun_permissions::Scope::FsRead, false) {
+            let _ = global.throw_value(err.to_js(global));
+            return JSValue::ZERO;
+        }
         if self.size.get() == MAX_SIZE {
             if self.is_s3() {
                 return JSValue::js_number(f64::NAN);
@@ -4498,6 +4603,8 @@ fn write_file_with_empty_source_to_destination(
     destination_blob: &mut Blob,
     options: &WriteFileOptions,
 ) -> JsResult<JSValue> {
+    check_blob_permission(destination_blob, bun_permissions::Scope::FsWrite, false)
+        .map_err(|err| ctx.throw_value(err.to_js(ctx)))?;
     // SAFETY: null-checked by caller
     let destination_store = destination_blob
         .store()
@@ -4706,6 +4813,12 @@ pub fn write_file_with_source_destination(
     destination_blob: &mut Blob,
     options: &WriteFileOptions,
 ) -> JsResult<JSValue> {
+    check_blob_permission(source_blob, bun_permissions::Scope::FsRead, true)
+        .and_then(|()| {
+            check_blob_permission(destination_blob, bun_permissions::Scope::FsWrite, true)
+        })
+        .map_err(|err| ctx.throw_value(err.to_js(ctx)))?;
+
     let destination_store = destination_blob
         .store
         .get()
@@ -5034,6 +5147,16 @@ pub fn write_file_internal(
     data: JSValue,
     options: WriteFileOptions,
 ) -> JsResult<JSValue> {
+    match &*path_or_blob_ {
+        PathOrBlob::Path(path) => {
+            check_file_permission(bun_permissions::Scope::FsWrite, path, true)
+        }
+        PathOrBlob::Blob(blob) => {
+            check_blob_permission(blob, bun_permissions::Scope::FsWrite, true)
+        }
+    }
+    .map_err(|err| global_this.throw_value(err.to_js(global_this)))?;
+
     if data.is_empty_or_undefined_or_null() {
         return Err(global_this.throw_invalid_arguments(format_args!(
             "Bun.write(pathOrFdOrBlob, blob) expects a Blob-y thing to write"
@@ -5422,6 +5545,13 @@ fn write_string_to_file_fast<const NEEDS_OPEN: bool>(
     str: BunString,
     needs_async: &mut bool,
 ) -> JSValue {
+    if let Err(err) = check_file_permission(bun_permissions::Scope::FsWrite, pathlike, true) {
+        return JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
+            global_this,
+            err.to_js(global_this),
+        );
+    }
+
     let fd: Fd = if !NEEDS_OPEN {
         pathlike.fd()
     } else {
@@ -5506,6 +5636,13 @@ fn write_bytes_to_file_fast<const NEEDS_OPEN: bool>(
     bytes: &[u8],
     _needs_async: &mut bool,
 ) -> JSValue {
+    if let Err(err) = check_file_permission(bun_permissions::Scope::FsWrite, pathlike, true) {
+        return JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
+            global_this,
+            err.to_js(global_this),
+        );
+    }
+
     let fd: Fd = if !NEEDS_OPEN {
         pathlike.fd()
     } else {
@@ -5814,6 +5951,8 @@ pub fn to_stream_with_offset(
         .this()
         .as_class_ref::<Blob>()
         .unwrap_or_else(|| panic!("this is not a Blob"));
+    check_blob_permission(this, bun_permissions::Scope::FsRead, true)
+        .map_err(|err| global_this.throw_value(err.to_js(global_this)))?;
     let args = callframe.arguments_old::<1>();
     ReadableStream::from_file_blob_with_offset(
         global_this,
@@ -6234,6 +6373,15 @@ fn stat_to_js_mtime(stat: &bun_sys::Stat) -> jsc::JSTimeType {
 
 /// resolve file stat like size, last_modified
 fn resolve_file_stat(store: &StoreRef) {
+    if check_file_permission(
+        bun_permissions::Scope::FsRead,
+        &store.data.as_file().pathlike,
+        false,
+    )
+    .is_err()
+    {
+        return;
+    }
     // `StoreRef::data_mut` encapsulates the raw-pointer deref under the
     // `StoreRef` liveness invariant; the caller holds the only ref across
     // this call, so an exclusive borrow is sound.

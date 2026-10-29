@@ -1,4 +1,5 @@
 use crate::mal_prelude::*;
+use crate::output_file::{check_output_path, create_output_directory};
 use std::io::Write as _;
 
 use bun_alloc::MaxHeapAllocator;
@@ -38,7 +39,10 @@ pub fn write_output_files_to_disk(
 ) -> Result<(), Error> {
     let _trace = bun_core::perf::trace("Bundler.writeOutputFilesToDisk");
 
-    let root_dir = match bun_sys::Dir::cwd().make_open_path(root_path, Default::default()) {
+    let root_dir = match (|| {
+        create_output_directory(bun_sys::Fd::cwd(), root_path)?;
+        bun_sys::Dir::cwd().make_open_path(root_path, Default::default())
+    })() {
         Ok(dir) => dir,
         Err(e) => {
             if e == err!("NotDir") {
@@ -99,12 +103,13 @@ pub fn write_output_files_to_disk(
                     .and_then(Option::take)
             {
                 let source_map_final_rel_path = strings::concat(&[&chunk.final_rel_path, b".map"]);
+                check_output_path(root_dir.fd(), &source_map_final_rel_path)?;
 
                 let rel_parent = paths::resolve_path::dirname::<paths::platform::Posix>(
                     &source_map_final_rel_path,
                 );
                 if !rel_parent.is_empty() {
-                    if let Err(e) = root_dir.make_path(rel_parent) {
+                    if let Err(e) = create_output_directory(root_dir.fd(), rel_parent) {
                         c.log_mut().add_error_fmt(
                             None,
                             Loc::EMPTY,
@@ -201,10 +206,11 @@ pub fn write_output_files_to_disk(
         // `code_allocator` is wired up it can borrow through `_code_allocator`.
         let _code_allocator = max_heap_allocator.scope();
 
+        check_output_path(root_dir.fd(), &chunk.final_rel_path)?;
         let rel_parent =
             paths::resolve_path::dirname::<paths::platform::Posix>(&chunk.final_rel_path);
         if !rel_parent.is_empty() {
-            if let Err(e) = root_dir.make_path(rel_parent) {
+            if let Err(e) = create_output_directory(root_dir.fd(), rel_parent) {
                 c.log_mut().add_error_fmt(
                     None,
                     Loc::EMPTY,
@@ -301,6 +307,7 @@ pub fn write_output_files_to_disk(
                         panic!("Failed to allocate memory for external source map")
                     });
                 let source_map_final_rel_path = strings::concat(&[&chunk.final_rel_path, b".map"]);
+                check_output_path(root_dir.fd(), &source_map_final_rel_path)?;
 
                 if tag == SourceMapOption::Linked {
                     let [a, b] = if !public_path.is_empty() {
@@ -429,6 +436,10 @@ pub fn write_output_files_to_disk(
                         fdpath[..frp.len()].copy_from_slice(frp);
                         fdpath[frp.len()..frp.len() + BYTECODE_EXTENSION.len()]
                             .copy_from_slice(BYTECODE_EXTENSION.as_bytes());
+                        check_output_path(
+                            root_dir.fd(),
+                            &fdpath[..frp.len() + BYTECODE_EXTENSION.len()],
+                        )?;
                         match write_file_with_path_buffer(
                             &mut pathbuf,
                             &WriteFileArgs {
@@ -644,9 +655,10 @@ pub fn write_output_files_to_disk(
             // `defer src.value.buffer.arena.free(bytes)` — `bytes` is now an
             // owned Box that drops at end of scope.
 
+            check_output_path(root_dir.fd(), &src.dest_path)?;
             let rel_parent = paths::resolve_path::dirname::<paths::platform::Auto>(&src.dest_path);
             if !rel_parent.is_empty() {
-                if let Err(e) = root_dir.make_path(rel_parent) {
+                if let Err(e) = create_output_directory(root_dir.fd(), rel_parent) {
                     c.log_mut().add_error_fmt(
                         None,
                         Loc::EMPTY,

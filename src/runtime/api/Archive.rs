@@ -1052,6 +1052,12 @@ impl WriteContext {
         };
         // `defer if (compress != .none) free(data_to_write)` — handled by `compressed_buf: Vec<u8>` Drop.
 
+        if check_archive_destination(Fd::cwd(), self.path.as_bytes(), false).is_err() {
+            return WriteResult::SysErr(
+                bun_sys::Error::from_code(bun_sys::E::EACCES, bun_sys::Tag::open)
+                    .with_path(self.path.as_bytes()),
+            );
+        }
         let file = match bun_sys::File::openat(
             Fd::cwd(),
             self.path.as_bytes(),
@@ -1404,6 +1410,51 @@ pub fn match_glob_patterns(patterns: &[Box<[u8]>], pathname: &[u8]) -> bool {
 
 /// Extract archive to disk with glob pattern filtering.
 /// Supports negative patterns with "!" prefix (e.g., "!node_modules/**").
+fn check_archive_destination(
+    directory: Fd,
+    path: &[u8],
+    entry_only: bool,
+) -> Result<(), bun_core::Error> {
+    if !bun_permissions::check_at_path(bun_permissions::Scope::FsWrite, directory, path, true)
+        || (!entry_only
+            && !bun_permissions::check_at_path(
+                bun_permissions::Scope::FsWrite,
+                directory,
+                path,
+                false,
+            ))
+    {
+        return Err(bun_core::err!("AccessDenied"));
+    }
+    Ok(())
+}
+
+fn create_archive_directory(directory: Fd, path: &[u8]) -> Result<(), bun_core::Error> {
+    if !bun_permissions::requires_path_check(bun_permissions::Scope::FsWrite) {
+        return directory.make_path(path);
+    }
+    check_archive_destination(directory, path, false)?;
+    // Use NodeFS's per-component mkdir checks instead of make_path, which can
+    // create several missing ancestors in a single unmediated operation.
+    let mut absolute = Vec::new();
+    if bun_paths::is_absolute(path) || directory == Fd::cwd() {
+        absolute.extend_from_slice(path);
+    } else {
+        let mut buffer = bun_paths::path_buffer_pool::get();
+        let parent = bun_sys::get_fd_path(directory, &mut buffer)?;
+        absolute.extend_from_slice(parent);
+        absolute.push(bun_paths::SEP);
+        absolute.extend_from_slice(path);
+    }
+    let args = crate::node::fs::args::Mkdir {
+        path: crate::node::types::PathLike::EncodedSlice(ZigStringSlice::init_owned(absolute)),
+        recursive: true,
+        ..Default::default()
+    };
+    crate::node::fs::NodeFS::default().mkdir_recursive(&args)?;
+    Ok(())
+}
+
 fn extract_to_disk_filtered(
     file_buffer: &[u8],
     root: &[u8],
@@ -1419,7 +1470,12 @@ fn extract_to_disk_filtered(
 
     // Open/create target directory using bun.sys
     let cwd = Fd::cwd();
-    let _ = cwd.make_path(root);
+    check_archive_destination(cwd, root, false)?;
+    if bun_permissions::requires_path_check(bun_permissions::Scope::FsWrite) {
+        create_archive_directory(cwd, root)?;
+    } else {
+        let _ = cwd.make_path(root);
+    }
     let dir_fd: Fd = 'brk: {
         if bun_paths::is_absolute(root) {
             break 'brk match bun_sys::open_a(root, bun_sys::O::RDONLY | bun_sys::O::DIRECTORY, 0) {
@@ -1464,12 +1520,21 @@ fn extract_to_disk_filtered(
 
         let filetype = entry_ref.filetype();
         let kind = bun_sys::kind_from_mode(filetype);
+        check_archive_destination(dir_fd, pathname, kind == bun_sys::FileKind::SymLink)?;
 
         match kind {
             bun_sys::FileKind::Directory => {
-                match dir_fd.make_path(pathname) {
+                match create_archive_directory(dir_fd, pathname) {
                     // Directory already exists - don't count as extracted
                     Err(e) if e == bun_core::err!("PathAlreadyExists") => continue,
+                    Err(e)
+                        if e == bun_core::err!("AccessDenied")
+                            && bun_permissions::requires_path_check(
+                                bun_permissions::Scope::FsWrite,
+                            ) =>
+                    {
+                        return Err(e);
+                    }
                     Err(_) => continue,
                     Ok(()) => {}
                 }
@@ -1487,11 +1552,18 @@ fn extract_to_disk_filtered(
 
                 // Create parent directories if needed (ignore expected errors)
                 if let Some(parent_dir) = bun_core::dirname(pathname) {
-                    match dir_fd.make_path(parent_dir) {
+                    match create_archive_directory(dir_fd, parent_dir) {
                         // Expected: directory already exists
                         Err(e) if e == bun_core::err!("PathAlreadyExists") => {}
                         // Permission errors: skip this file, will fail at openat
-                        Err(e) if e == bun_core::err!("AccessDenied") => {}
+                        Err(e)
+                            if e == bun_core::err!("AccessDenied")
+                                && bun_permissions::is_restricted(
+                                    bun_permissions::Scope::FsWrite,
+                                ) =>
+                        {
+                            return Err(e);
+                        }
                         // Other errors: skip, will fail at openat
                         Err(_) => {}
                         Ok(()) => {}
@@ -1550,6 +1622,7 @@ fn extract_to_disk_filtered(
                     count += 1;
                 } else {
                     // Remove partial file on failure
+                    check_archive_destination(dir_fd, pathname, true)?;
                     let _ = bun_sys::unlinkat(dir_fd, pathname_z);
                 }
             }
@@ -1559,6 +1632,20 @@ fn extract_to_disk_filtered(
                 if !is_safe_path(link_target_z.as_bytes()) {
                     continue;
                 }
+                let mut target = Vec::new();
+                if let Some(parent) = bun_core::dirname(pathname) {
+                    target.extend_from_slice(parent);
+                    target.push(bun_paths::SEP);
+                }
+                target.extend_from_slice(link_target_z.as_bytes());
+                if !bun_permissions::check_at_path(
+                    bun_permissions::Scope::FsRead,
+                    dir_fd,
+                    &target,
+                    false,
+                ) {
+                    return Err(bun_core::err!("AccessDenied"));
+                }
                 // Symlinks are only extracted on POSIX systems (Linux/macOS).
                 // On Windows, symlinks are skipped since they require elevated privileges.
                 #[cfg(unix)]
@@ -1567,7 +1654,7 @@ fn extract_to_disk_filtered(
                         Err(err) => {
                             if matches!(err.get_errno(), bun_sys::E::EPERM | bun_sys::E::ENOENT) {
                                 if let Some(parent) = bun_core::dirname(pathname) {
-                                    let _ = dir_fd.make_path(parent);
+                                    create_archive_directory(dir_fd, parent)?;
                                 }
                                 if bun_sys::symlinkat(link_target_z, dir_fd, pathname_z).is_err() {
                                     continue;

@@ -32,6 +32,7 @@ pub struct SocketAddress {
     ///
     /// @internal
     _presentation: Cell<BunString>,
+    authorization: Cell<Option<bun_permissions::ResolvedNetworkEndpoint>>,
 }
 
 impl Default for SocketAddress {
@@ -39,11 +40,40 @@ impl Default for SocketAddress {
         Self {
             _addr: sockaddr::LOOPBACK_V4,
             _presentation: Cell::new(BunString::dead()),
+            authorization: Cell::new(None),
         }
     }
 }
 
 impl SocketAddress {
+    pub(crate) fn take_network_authorization(
+        &self,
+    ) -> Option<bun_permissions::ResolvedNetworkEndpoint> {
+        self.authorization.take()
+    }
+
+    pub(crate) fn resolved_endpoint(
+        global: &JSGlobalObject,
+        host: &[u8],
+        address: &[u8],
+        port: u16,
+    ) -> JsResult<JSValue> {
+        let authorization = bun_permissions::ResolvedNetworkEndpoint::issue(host, address, port)
+            .map_err(|_| {
+                global.throw(format_args!("Resolved network endpoint permission denied"))
+            })?;
+        let ip = std::str::from_utf8(address)
+            .ok()
+            .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+            .ok_or_else(|| global.throw(format_args!("Invalid resolved network address")))?;
+        let endpoint = match ip {
+            std::net::IpAddr::V4(ip) => Self::init_ipv4(ip.octets(), port),
+            std::net::IpAddr::V6(ip) => Self::init_ipv6(ip.octets(), port, 0, 0),
+        };
+        endpoint.authorization.set(Some(authorization));
+        Ok(Box::new(endpoint).to_js(global))
+    }
+
     pub fn new(init: SocketAddress) -> Box<SocketAddress> {
         Box::new(init)
     }
@@ -266,6 +296,7 @@ impl SocketAddress {
             SocketAddress {
                 _addr: sockaddr { sin6 },
                 _presentation: Cell::new(BunString::dead()),
+                authorization: Cell::new(None),
             }
         } else {
             let mut sin = inet::sockaddr_in {
@@ -280,6 +311,7 @@ impl SocketAddress {
             SocketAddress {
                 _addr: sockaddr { sin },
                 _presentation: Cell::new(BunString::dead()),
+                authorization: Cell::new(None),
             }
         };
 
@@ -318,6 +350,7 @@ impl SocketAddress {
             return Ok(SocketAddress::new(SocketAddress {
                 _addr: sockaddr::LOOPBACK_V4,
                 _presentation: Cell::new(BunString::empty()),
+                authorization: Cell::new(None),
                 // ._presentation = WellKnownAddress::loopback_v4(),
             }));
         }
@@ -334,6 +367,7 @@ impl SocketAddress {
             return Ok(SocketAddress::new(SocketAddress {
                 _addr: sockaddr::ANY_V6,
                 _presentation: Cell::new(BunString::empty()),
+                authorization: Cell::new(None),
                 // ._presentation = WellKnownAddress::any_v6(),
             }));
         }
@@ -433,6 +467,7 @@ impl SocketAddress {
         Ok(SocketAddress {
             _addr: addr,
             _presentation: Cell::new(presentation),
+            authorization: Cell::new(None),
         })
     }
 }
@@ -473,6 +508,7 @@ impl SocketAddress {
         SocketAddress {
             _addr: sockaddr::v4(port_.to_be(), u32::from_ne_bytes(addr)),
             _presentation: Cell::new(BunString::dead()),
+            authorization: Cell::new(None),
         }
     }
 
@@ -485,6 +521,7 @@ impl SocketAddress {
         SocketAddress {
             _addr: sockaddr::v6(port_.to_be(), addr, flowinfo, scope_id),
             _presentation: Cell::new(BunString::dead()),
+            authorization: Cell::new(None),
         }
     }
 }

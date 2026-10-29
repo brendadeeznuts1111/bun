@@ -269,6 +269,16 @@ impl PathWatcher {
         is_file: bool,
         event_type: EventType,
     ) {
+        if bun_permissions::is_restricted(bun_permissions::Scope::FsRead) {
+            if self.handle.path.is_null() {
+                return;
+            }
+            // SAFETY: libuv owns the NUL-terminated watch path while this handle is live.
+            let root = unsafe { core::ffi::CStr::from_ptr(self.handle.path) }.to_bytes();
+            if !super::path_watcher::permission_allows_event(root, path) {
+                return;
+            }
+        }
         self.emit_in_progress = true;
         #[cfg(debug_assertions)]
         let mut debug_count: usize = 0;
@@ -315,6 +325,11 @@ impl PathWatcher {
         path: &ZStr,
         recursive: bool,
     ) -> sys::Result<*mut PathWatcher> {
+        if !bun_permissions::check_path(bun_permissions::Scope::FsRead, path.as_bytes()) {
+            return Err(
+                sys::Error::from_code(sys::E::EACCES, sys::Tag::watch).with_path(path.as_bytes())
+            );
+        }
         let mut outbuf = PathBuffer::uninit();
         // Windows `sys::readlink` returns the byte length; the link target is
         // written into `outbuf[..len]` with `outbuf[len] == 0` (sys_uv NUL-terminates). Reconstruct

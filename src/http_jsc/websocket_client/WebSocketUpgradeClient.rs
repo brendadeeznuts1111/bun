@@ -248,9 +248,34 @@ impl<const SSL: bool> HTTPClient<SSL> {
         let extra_headers = unsafe { Headers8Bit::init(header_names, header_values, header_count) };
 
         let proxy_host_slice: Option<Utf8Slice> = proxy_host.map(|ph| ph.to_utf8());
+        let unix_socket_path_slice: Option<Utf8Slice> = unix_socket_path.map(|usp| usp.to_utf8());
+        let destination = match unix_socket_path_slice.as_ref() {
+            Some(path) => bun_permissions::NetworkResource::UnixSocket(path.slice()),
+            None => bun_permissions::NetworkResource::Endpoint {
+                host: host_slice.slice(),
+                port,
+            },
+        };
+        let denied =
+            bun_permissions::check_network(bun_permissions::NetworkOperation::Connect, destination)
+                .is_err()
+                || proxy_host_slice.as_ref().is_some_and(|proxy| {
+                    bun_permissions::check_network(
+                        bun_permissions::NetworkOperation::Connect,
+                        bun_permissions::NetworkResource::Endpoint {
+                            host: proxy.slice(),
+                            port: proxy_port,
+                        },
+                    )
+                    .is_err()
+                });
+        if denied {
+            global.throw(format_args!("WebSocket network permission denied"));
+            return None;
+        }
+
         let target_authorization_slice: Option<Utf8Slice> =
             target_authorization.map(|ta| ta.to_utf8());
-        let unix_socket_path_slice: Option<Utf8Slice> = unix_socket_path.map(|usp| usp.to_utf8());
 
         let using_proxy = proxy_host.is_some();
 

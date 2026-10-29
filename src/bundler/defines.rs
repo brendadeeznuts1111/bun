@@ -136,11 +136,10 @@ pub fn copy_env_for_define(
         // with `prefix`, the entire second walk (including the framework-hash `else` arm)
         // must be skipped. Pre-scan for a prefix match before emitting.
         let any_prefix_match = if behavior == DotEnvBehavior::Prefix {
-            env.map
-                .map
-                .keys()
-                .iter()
-                .any(|k| bun_core::starts_with(k, prefix))
+            env.map.map.keys().iter().any(|k| {
+                bun_core::starts_with(k, prefix)
+                    && bun_permissions::allows(bun_permissions::Scope::Env, k)
+            })
         } else {
             true
         };
@@ -152,7 +151,7 @@ pub fn copy_env_for_define(
             let keys = env.map.map.keys();
             let values = env.map.map.values();
             for (k, v) in keys.iter().zip(values.iter()) {
-                if k.is_empty() {
+                if k.is_empty() || !bun_permissions::allows(bun_permissions::Scope::Env, k) {
                     continue;
                 }
                 let value: &[u8] = &v.value;

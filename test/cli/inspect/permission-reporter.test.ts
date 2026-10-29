@@ -1,8 +1,11 @@
 import { expect, test } from "bun:test";
+import { bunEnv, bunExe, tempDir } from "harness";
+import { join } from "node:path";
 import type { JSC } from "../../../packages/bun-inspector-protocol/src/protocol/jsc";
 import { checkAndReport, checkPermissions, formatPermissionResult } from "./permission-helper.ts";
 import { CustomTestReporter } from "./custom.test.reporter.ts";
 import { InspectorSession } from "./junit-reporter.ts";
+import { SocketFramer } from "./socket-framer.ts";
 
 test("permission helper formats and evaluates checks", () => {
   const api = { has: (scope: string, resource?: string) => scope === "net" && resource === "example.com" };
@@ -85,8 +88,174 @@ test("custom reporter records protocol metadata, elapsed duration, output, and l
     "TestReporter.enable",
     "LifecycleReporter.enable",
     "Console.enable",
+    "Inspector.initialized",
   ]);
   expect(JSON.parse(reporter.format())).toEqual(reporter.toJSON());
+});
+
+test("custom reporter receives permission results over the Inspector socket", async () => {
+  const helper = JSON.stringify(join(import.meta.dir, "permission-helper.ts"));
+  using dir = tempDir("permission-reporter", {
+    "permission-fixture.test.ts": `
+      import { test, expect } from "bun:test";
+      import { checkAndReport } from ${helper};
+      test("allowed environment check", () => {
+        expect(checkAndReport("env", "PERMISSION_REPORTER_ALLOWED")).toBe(true);
+      });
+      test("denied environment check", () => {
+        expect(checkAndReport("env", "PERMISSION_REPORTER_DENIED")).toBe(false);
+        console.error("permission denial diagnostic");
+        throw new Error("permission fixture failure");
+      });
+    `,
+  });
+  const socketPath = join(String(dir), "inspector.sock");
+  const connected = Promise.withResolvers<CustomTestReporter>();
+  const disconnected = Promise.withResolvers<void>();
+  const session = new InspectorSession();
+  const framer = new SocketFramer(message => session.onMessage(message));
+  using listener = Bun.listen<NonNullable<InspectorSession["socket"]>["data"]>({
+    unix: socketPath,
+    socket: {
+      open(socket) {
+        session.socket = socket;
+        session.framer = framer;
+        socket.data = { onData: framer.onData.bind(framer) };
+        connected.resolve(new CustomTestReporter(session));
+      },
+      data(socket, data) {
+        socket.data.onData(socket, data);
+      },
+      close() {
+        disconnected.resolve();
+      },
+      error(_socket, error) {
+        connected.reject(error);
+      },
+    },
+  });
+  await using child = Bun.spawn({
+    cmd: [
+      bunExe(),
+      `--inspect-wait=unix:${socketPath}`,
+      "--experimental-permissions",
+      "--allow-inspector",
+      "--allow-env=PERMISSION_REPORTER_ALLOWED",
+      "test",
+      "permission-fixture.test.ts",
+    ],
+    cwd: String(dir),
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const output = Promise.all([child.stdout.text(), child.stderr.text(), child.exited]);
+  try {
+    const reporter = await Promise.race([
+      connected.promise,
+      child.exited.then(code => {
+        throw new Error(`Inspector child exited before connecting: ${code}`);
+      }),
+    ]);
+    listener.stop();
+    const [[stdout, stderr, exitCode]] = await Promise.all([output, disconnected.promise]);
+    expect(stdout).toContain("PERMISSION_REPORTER_ALLOWED");
+    expect(stderr).toContain("permission fixture failure");
+    const report = reporter.toJSON();
+    expect(report.tests).toHaveLength(2);
+    const [allowed, denied] = report.tests;
+    expect(allowed.name).toBe("allowed environment check");
+    expect(allowed.status).toBe("pass");
+    expect(allowed.stdout).toHaveLength(1);
+    expect(allowed.stdout[0]).toContain("✅ env PERMISSION_REPORTER_ALLOWED");
+    expect(allowed.stderr).toEqual([]);
+    expect(denied.name).toBe("denied environment check");
+    expect(denied.status).toBe("fail");
+    expect(denied.stdout).toHaveLength(1);
+    expect(denied.stdout[0]).toContain("❌ env PERMISSION_REPORTER_DENIED");
+    expect(denied.stderr).toEqual(["permission denial diagnostic"]);
+    expect(denied.error?.message).toBe("permission fixture failure");
+    expect(denied.error?.name).toBe("Error");
+    for (const result of report.tests) {
+      expect(result.file).toContain("permission-fixture.test.ts");
+      expect(result.duration).toBeNumber();
+      expect(result.duration).toBeGreaterThanOrEqual(0);
+    }
+    expect(JSON.parse(reporter.format())).toEqual(report);
+    expect(exitCode).toBe(1);
+  } finally {
+    session.socket?.end();
+    child.kill();
+    await output;
+  }
+});
+
+test("standalone custom reporter emits JSON and exits when the Inspector disconnects", async () => {
+  using dir = tempDir("permission-reporter-cli", {
+    "standalone.test.ts": `
+      import { test, expect } from "bun:test";
+      test("standalone permission check", () => {
+        expect(process.permission.has("env", "PERMISSION_REPORTER_ALLOWED")).toBe(true);
+        console.log("standalone permission output");
+      });
+    `,
+  });
+  const socketPath = join(String(dir), "inspector.sock");
+  const listening = Promise.withResolvers<void>();
+  await using reporter = Bun.spawn({
+    cmd: [bunExe(), join(import.meta.dir, "custom.test.reporter.ts"), `unix://${socketPath}`],
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+    ipc(message: unknown) {
+      if (
+        typeof message === "object" &&
+        message !== null &&
+        "type" in message &&
+        message.type === "inspector-listening"
+      ) {
+        listening.resolve();
+      }
+    },
+  });
+  const reporterOutput = Promise.all([reporter.stdout.text(), reporter.stderr.text(), reporter.exited]);
+  try {
+    await Promise.race([
+      listening.promise,
+      reporter.exited.then(code => {
+        throw new Error(`Standalone reporter exited before listening: ${code}`);
+      }),
+    ]);
+    await using child = Bun.spawn({
+      cmd: [
+        bunExe(),
+        `--inspect-wait=unix:${socketPath}`,
+        "--experimental-permissions",
+        "--allow-inspector",
+        "--allow-env=PERMISSION_REPORTER_ALLOWED",
+        "test",
+        "standalone.test.ts",
+      ],
+      cwd: String(dir),
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([child.stdout.text(), child.stderr.text(), child.exited]);
+    expect(stdout).toContain("standalone permission output");
+    expect(stderr).toContain("1 pass");
+    expect(exitCode).toBe(0);
+    const [json, reporterStderr, reporterExitCode] = await reporterOutput;
+    const report: unknown = JSON.parse(json);
+    expect(report).toMatchObject({
+      tests: [{ name: "standalone permission check", status: "pass", stdout: ["standalone permission output"] }],
+    });
+    expect(reporterStderr).toBe("");
+    expect(reporterExitCode).toBe(0);
+  } finally {
+    reporter.kill();
+    await reporterOutput;
+  }
 });
 
 test.each([1, 2])("custom reporter retains ambiguous events when overlapping test %i ends first", firstEnd => {

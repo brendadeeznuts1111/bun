@@ -1779,6 +1779,9 @@ mod spawn_process_body {
         argv: Argv, // [*:null]?[*:0]const u8
         envp: Envp,
     ) -> Result<bun_sys::Result<SpawnProcessResult>, bun_core::Error> {
+        if !bun_permissions::capability_allowed(bun_permissions::Capability::Subprocess) {
+            return Err(bun_core::err!("AccessDenied"));
+        }
         #[cfg(unix)]
         {
             // SAFETY: forwarded from this function's safety contract.
@@ -1796,6 +1799,9 @@ mod spawn_process_body {
         argv: *const *const c_char,
         envp: *const *const c_char,
     ) -> Result<bun_sys::Result<WindowsSpawnResult>, bun_core::Error> {
+        if !bun_permissions::capability_allowed(bun_permissions::Capability::Subprocess) {
+            return Err(bun_core::err!("AccessDenied"));
+        }
         bun_analytics::features::spawn.fetch_add(1, Ordering::Relaxed);
 
         // SAFETY: all-zero is a valid uv_process_options_t
@@ -2782,6 +2788,9 @@ mod spawn_process_body {
             argv: *const *const c_char,
             envp: *const *const c_char,
         ) -> core::result::Result<Maybe<Result>, bun_core::Error> {
+            if !bun_permissions::capability_allowed(bun_permissions::Capability::Subprocess) {
+                return Err(bun_core::err!("AccessDenied"));
+            }
             #[cfg(windows)]
             {
                 if options.stdin != SyncStdio::Buffer
@@ -2798,6 +2807,9 @@ mod spawn_process_body {
         }
 
         pub fn spawn(options: &Options) -> core::result::Result<Maybe<Result>, bun_core::Error> {
+            if !bun_permissions::capability_allowed(bun_permissions::Capability::Subprocess) {
+                return Err(bun_core::err!("AccessDenied"));
+            }
             // SAFETY: `bun_sys::environ_ptr` returns the live, NULL-terminated C
             // `environ` array when no envp override is provided.
             let envp: *const *const c_char = options.envp.unwrap_or_else(bun_sys::environ_ptr);

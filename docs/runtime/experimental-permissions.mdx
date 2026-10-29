@@ -1,114 +1,78 @@
 ---
 title: Experimental permissions and diagnostics
-description: Current architecture and implementation status for Bun's experimental permission workflow.
+description: Process-wide resource policy for trusted application code.
 ---
 
-This feature is opt-in. Bun's default behavior remains unrestricted unless
-`--experimental-permissions` is supplied.
+The permission model is opt-in. Without `--experimental-permissions`, Bun remains unrestricted and `process.permission.has()` reports unrestricted access for recognized scopes. This experimental feature constrains trusted application code. It is not an operating-system sandbox for hostile code, native extensions, or a concurrently changing filesystem.
 
-The additive `process.permission.has()` API is available for diagnostics in
-default mode and reports unrestricted access there; enforcement begins only
-when the experimental gate is enabled.
+## Policy and grants
 
-```mermaid
-flowchart TD
-    CLI[Bun CLI] --> Gate{--experimental-permissions?}
-    Gate -->|No| Default[Existing unrestricted behavior]
-    Gate -->|Yes| Store[Shared permission configuration]
-    Store --> Query[process.permission.has]
-    Store --> Flags[--secure and allow-lists]
+`--secure` denies resource access by default. Explicit allow-lists constrain their scope even without `--secure`; omitted scopes otherwise remain unrestricted. Permission flags require `--experimental-permissions`. Whenever any resource scope is restricted, capabilities such as subprocesses and native code also require their explicit grants.
 
-    Query --> Net[Network hook<br/>fetch]
-    Query --> NetPlanned[Bun.serve / Bun.connect hooks]
-    Query --> Env[Environment hooks<br/>initial native environment reads]
-    Query --> EnvPlanned[Environment enumeration filtering]
-    Query --> FS[Filesystem hooks<br/>Node fs paths now; Bun.file/build later]
-    Query --> ImagePlanned[Bun.Image read/write hooks]
-    Query --> HttpPlanned[HTTP/3, QUIC, WebSocket scopes]
-    Query --> RuntimePlanned[spawn, sys, FFI, workers]
-
-    FS --> Warning[Current: partial Node fs path enforcement + warning]
-    Net --> NetworkStatus[Experimental enforcement]
-    Env --> EnvironmentStatus[Experimental enforcement]
-    FS --> FilesystemStatus[Planned: Bun.file, canonical paths, full API coverage]
-
-    Net --> Reporter[Permission helper + Inspector reporter]
-    Env --> Reporter
-    FS --> Reporter
-    Reporter --> Events[TestReporter.* + LifecycleReporter.error]
-    Reporter --> Console[Console.messageAdded diagnostics]
-    Reporter --> RegenerationPlanned[Regeneration engine / Mermaid refresh]
-
-    classDef implemented fill:#2d7d46,stroke:#4fb07a,color:#fff
-    classDef experimental fill:#a66b1f,stroke:#e5a84b,color:#fff
-    classDef planned fill:#555,stroke:#999,color:#fff
-
-    class CLI,Default,Store,Query,Flags,Reporter,Events,Console implemented
-    class Net,Env,NetworkStatus,EnvironmentStatus experimental
-    class NetPlanned,EnvPlanned,FilesystemStatus,ImagePlanned,HttpPlanned,RuntimePlanned,RegenerationPlanned planned
-    class FS,Warning experimental
+```sh
+bun --experimental-permissions --secure --allow-read=./app --allow-net=api.example.com:443 ./app/index.ts
 ```
 
-Current implementation includes the gated CLI flags, the query API, the
-permission helper, and the Inspector Protocol reporter. Filesystem access is
-partially gated for Node fs path operations and still
-emits a warning; Bun.file, path canonicalization/symlink handling, and full API
-coverage remain planned. Initial native environment reads are gated. Ordinary JavaScript writes, cached
-properties, deletion, enumeration, and special environment setters are not fully
-mediated; this draft does not provide an environment isolation boundary. Additional network hooks (serve/connect)
-and scopes such as subprocess, system information, FFI, and workers remain
-planned.
+The CLI publishes one immutable process-wide policy before loading user modules or preloads. Workers inherit that policy; replacing `execArgv` does not replace it. User entry points, imports, and build inputs require read grants. Built-in modules do not require grants to their internal implementation files.
 
-The broader ecosystem vision—Bun.Image, HTTP/3/QUIC and WebSocket policy
-scopes, subprocess/system/FFI/worker scopes, and a self-regenerating Mermaid
-workflow—is represented as planned architecture here. It must not be read as
-current enforcement coverage; each item needs its own runtime hook and focused
-test before moving into the experimental/implemented classes above.
+| Flag                      | Authority                                                                        |
+| ------------------------- | -------------------------------------------------------------------------------- |
+| `--allow-read=path`       | Read a canonical file or directory subtree                                       |
+| `--allow-write=path`      | Modify a canonical file or directory subtree                                     |
+| `--allow-net=host[:port]` | Connect, listen, and resolve the named host                                      |
+| `--allow-env=NAME`        | Read and mutate a named environment variable                                     |
+| `--allow-run`             | Start subprocesses, execute shell commands, and use persistent system scheduling |
+| `--allow-worker`          | Start workers under the same process policy                                      |
+| `--allow-ffi`             | Load or execute native code, including native addons and SQLite extensions       |
+| `--allow-sys`             | Access protected host information and process controls                           |
+| `--allow-inspector`       | Start or connect the Inspector                                                   |
 
-## Enforcement limits
+Resource lists accept `*` to leave that scope unrestricted. Environment grants may also end in `*` to match a name prefix. Empty or malformed grants are rejected before user code. Native-code and subprocess grants confer broader authority than Bun's resource checks: those programs and libraries can use operating-system APIs directly.
 
-This prototype is not a sandbox and must not run untrusted code. Filesystem
-checks cover selected Node fs path operations, use lexical path grants, reject
-parent (`..`) components, and accept directory grants with trailing separators.
-They do not canonicalize symlinks or mediate every filesystem API. Existing file
-descriptors are not reauthorized. `readFile` flags that request writing require
-both read and write grants before opening the file.
+`process.permission.has(scope, resource)` queries the same policy. Resource scopes are `fs.read`, `fs.write`, `net`, and `env`; capability scopes include `run`, `worker`, `ffi`, `sys`, and `inspector`. Capability queries ignore the resource argument. A resource-less query for a restricted resource scope returns false. `has("net", "host")` queries hostname resolution authority; use `has("net", "host:port")` to query the transport port. Local-socket queries test connection authority; a filesystem Unix listener separately needs write authority. A query is diagnostic; an earlier successful query does not reserve access for a later operation.
 
-Network grants match hostnames without ports; exact hosts and wildcard suffixes
-are case-insensitive. With a restrictive network grant, automatic fetch redirects
-are rejected because subsequent hops are not separately authorized. Explicit
-`redirect: "manual"` remains available for inspecting a redirect and issuing a
-new checked fetch. An unrestricted `--allow-net=*` retains normal redirect
-behavior. Other networking APIs and native proxy connections are outside the
-current enforcement coverage.
+## Filesystem behavior
+
+Checks resolve symlinks and authorize the actual target. Operations on directory entries authorize the canonical parent and entry; a trailing separator follows the final symlink as the operating system does. File-descriptor operations reauthorize the descriptor's current path. Standard-stream Blob transfers retain stdin read and stdout/stderr write authority; that exception does not grant filesystem metadata access. Read/write opens require both grants. Parent components (`..`), malformed paths, and paths that cannot be safely resolved fail closed.
+
+Hooks cover Node filesystem operations, Blob and Bun file transfers, streams and server file responses, watchers, archive/image operations, glob traversal, module resolution, build inputs/outputs, and CPU/heap profiler output. Recursive operations check visited entries instead of granting an entire traversal from its starting directory. These checks do not eliminate races between pathname authorization and the operating-system operation; use an OS security boundary where another actor can replace paths maliciously.
+
+SQLite uses a permission-aware VFS for database files, journals, WAL and shared-memory sidecars. A database-file grant does not grant its sidecars. Grant the containing directory when those operations are required. Memory databases remain available. Native VFS selection, extensions, custom libraries and native file controls cannot bypass a restricted policy without native authority. Unnamed temporary files fail closed under filesystem restrictions. Restricted SQLite uses checked reads instead of memory mapping; a read-only WAL database can still require sidecar write authority.
+
+On Windows, a restricted network policy also checks filesystem paths before canonicalization. Ordinary local disk paths are supported; direct UNC paths need a matching hostname grant without a port. Following reparse points, mapped drives, SUBST drives, and unknown device mappings is conservatively rejected. Entry metadata and removal can still operate on a link itself; trailing separators request traversal and are checked accordingly. Descriptor checks use the opened name before canonicalization. These Windows paths have separate cross-target compiler coverage; runtime execution still requires a Windows host.
+
+## Network behavior
+
+Host grants are case-insensitive ASCII hostnames or canonical IP addresses, optionally followed by a port. Use punycode for internationalized hostnames and brackets around IPv6 addresses with ports. `*.example.com` matches subdomains at a label boundary. DNS resolution authorizes the hostname; a port on a grant constrains transport, not the DNS query itself.
+
+Fetch authorizes every redirect destination and proxy connection. HTTP, WebSocket, TCP, UDP, DNS and server listeners check their actual endpoint. Node's default DNS-to-connect path carries native authorization tied to the resolved address and port. A custom lookup callback needs a grant for the IP address it returns. Adopting an existing socket descriptor is currently unsupported under a restricted network policy, even when its peer would otherwise be permitted.
+
+Local socket grants use `unix:/absolute/path`, `abstract:name` for Linux abstract sockets, or `pipe:name` for Windows pipes. A filesystem Unix listener also requires write authority for its socket path. A Unix HTTP request checks its socket rather than the synthetic URL hostname.
+
+## Environment and native defaults
+
+Restricted environment objects filter initial reads, enumeration, descriptors and cached properties. Denied reads return `undefined`; denied writes, deletions and definitions throw before the target mutation. JavaScript argument expressions and descriptor getters execute according to ordinary JavaScript evaluation rules. Windows names are case-insensitive. Prototype or reflection operations do not reveal a separate unrestricted backing object.
+
+Native environment consumers, including bundler inlining, server defaults, object-storage credentials and Redis defaults, use the same grants. Explicit application options remain available when their operation is otherwise permitted.
 
 ## Reporter output
 
-The draft Inspector reporter emits an object with `tests` and `diagnostics`
-arrays. Test durations use the protocol's elapsed milliseconds. Console and
-lifecycle events have no test identifier: events received with exactly one
-active test are attached to that test; events received with zero or multiple
-active tests are retained in `diagnostics` with the active IDs and a reason.
-This preserves ambiguous output without guessing which overlapping test emitted
-it. This envelope replaces the earlier draft's bare test array.
+The Inspector reporter emits an object with `tests` and `diagnostics` arrays. Durations use protocol milliseconds. Console and lifecycle events received with exactly one active test attach to that test; otherwise they remain in `diagnostics` with the active IDs and a reason. The reporter waits for Inspector initialization and collects events through disconnect.
 
 ## Development verification
 
-Run these checks from this worktree:
+Run from the owning checkout:
 
 ```sh
 bun install --frozen-lockfile
+bun install --frozen-lockfile --cwd test
 bun run typecheck:permissions
-bun bd test test/cli/permissions.test.ts test/cli/inspect/permission-reporter.test.ts test/js/bun/test/expect-extend-preload.test.ts
+bun bd test test/cli/permissions.test.ts test/cli/inspect/permission-reporter.test.ts test/js/bun/test/expect-extend-preload.test.ts test/cli/heap-prof.test.ts
 bun test test/integration/bun-types/bun-types.test.ts
 ```
 
-`typecheck:permissions` checks the permission tests, reporter, matcher regression
-coverage, and their imported harness code using the repository's compiler
-settings. It is a focused local check, not a whole-repository or CI gate.
-The declaration integration suite checks packaged types with library checking
-on, both with and without DOM declarations. Its JavaScript compiler fixture is
-pinned to TypeScript 6.0.2 with Node 25 types; a separate CLI fixture checks the
-stable TypeScript 7 compiler. The direct `bun test` declaration command is the
-repository's documented exception for type-only validation. Native runtime
-changes must use `bun bd` so the locally built permission hooks are exercised.
+Native validation must use `bun bd` so tests exercise the modified executable. The declaration integration command is the repository's documented exception for type-only validation. `typecheck:permissions` is a focused compiler check of the permission tests, profiler tests, reporter, matcher regression coverage, and imported harness; it does not check the entire repository.
+
+A passing local suite proves its exercised paths on that host. Cross-platform execution and admitted CI jobs require separate evidence; saved workflow configuration alone does not establish either.
+
+The `Permission declarations and lint` GitHub workflow checks focused types, packaged declarations and JavaScript lint using Bun 1.4.4. Native runtime tests remain part of the repository’s Buildkite test pipeline; that GitHub workflow does not build or test the native runtime.

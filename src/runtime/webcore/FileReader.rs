@@ -146,6 +146,7 @@ unsafe extern "C" {
 
 impl Lazy {
     pub fn open_file_blob(file: &mut blob::store::File) -> sys::Result<OpenedFileBlob> {
+        blob::check_file_permission(bun_permissions::Scope::FsRead, &file.pathlike, true)?;
         let mut this = OpenedFileBlob {
             fd: Fd::INVALID,
             ..Default::default()

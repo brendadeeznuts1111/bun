@@ -171,6 +171,22 @@ impl SocketGroup {
         socket_ext_size: c_int,
         err: &mut c_int,
     ) -> *mut ListenSocket {
+        let endpoint = bun_permissions::NetworkResource::Endpoint {
+            host: host.map_or(b"0.0.0.0".as_slice(), |value| value.to_bytes()),
+            port: match u16::try_from(port) {
+                Ok(port) => port,
+                Err(_) => {
+                    *err = libc::EACCES;
+                    return ptr::null_mut();
+                }
+            },
+        };
+        if bun_permissions::check_network(bun_permissions::NetworkOperation::Listen, endpoint)
+            .is_err()
+        {
+            *err = libc::EACCES;
+            return ptr::null_mut();
+        }
         // SAFETY: forwarding to C; all pointers are valid or null as documented.
         unsafe {
             us_socket_group_listen(
@@ -195,6 +211,15 @@ impl SocketGroup {
         socket_ext_size: c_int,
         err: &mut c_int,
     ) -> *mut ListenSocket {
+        if bun_permissions::check_network(
+            bun_permissions::NetworkOperation::Listen,
+            bun_permissions::NetworkResource::UnixSocket(path),
+        )
+        .is_err()
+        {
+            *err = libc::EACCES;
+            return ptr::null_mut();
+        }
         // SAFETY: forwarding to C; `path` ptr+len derived from a valid slice.
         unsafe {
             us_socket_group_listen_unix(
@@ -220,6 +245,42 @@ impl SocketGroup {
         options: c_int,
         socket_ext_size: c_int,
     ) -> ConnectResult {
+        self.connect_authorized(
+            kind,
+            ssl_ctx,
+            host,
+            port,
+            local_binding,
+            options,
+            socket_ext_size,
+            None,
+        )
+    }
+
+    pub fn connect_authorized(
+        &mut self,
+        kind: SocketKind,
+        ssl_ctx: Option<*mut SslCtx>,
+        host: &core::ffi::CStr,
+        port: c_int,
+        local_binding: Option<(&core::ffi::CStr, u16)>,
+        options: c_int,
+        socket_ext_size: c_int,
+        authorization: Option<&bun_permissions::ResolvedNetworkEndpoint>,
+    ) -> ConnectResult {
+        let endpoint = bun_permissions::NetworkResource::Endpoint {
+            host: host.to_bytes(),
+            port: match u16::try_from(port) {
+                Ok(port) => port,
+                Err(_) => return ConnectResult::Failed,
+            },
+        };
+        if !authorization.is_some_and(|token| token.matches(host.to_bytes(), port as u16))
+            && bun_permissions::check_network(bun_permissions::NetworkOperation::Connect, endpoint)
+                .is_err()
+        {
+            return ConnectResult::Failed;
+        }
         // context.c writes 1 here on the synchronous path (DNS already resolved
         // → real `us_socket_t*` returned), 0 when it hands back a
         // `us_connecting_socket_t*` placeholder. Named to match the C side so
@@ -258,6 +319,14 @@ impl SocketGroup {
         options: c_int,
         socket_ext_size: c_int,
     ) -> *mut us_socket_t {
+        if bun_permissions::check_network(
+            bun_permissions::NetworkOperation::Connect,
+            bun_permissions::NetworkResource::UnixSocket(path),
+        )
+        .is_err()
+        {
+            return ptr::null_mut();
+        }
         // SAFETY: forwarding to C; `path` ptr+len derived from a valid slice.
         unsafe {
             us_socket_group_connect_unix(
@@ -280,6 +349,9 @@ impl SocketGroup {
         fd: LIBUS_SOCKET_DESCRIPTOR,
         ipc: bool,
     ) -> *mut us_socket_t {
+        if bun_permissions::is_restricted(bun_permissions::Scope::Net) {
+            return ptr::null_mut();
+        }
         // SAFETY: forwarding to C.
         unsafe {
             us_socket_from_fd(

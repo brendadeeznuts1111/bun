@@ -1243,6 +1243,7 @@ impl RealFS {
         let existing_ptr = map.at_index(index)?;
         // SAFETY: `entries_mutex` held; no other `&mut` to this slot in scope.
         if let EntriesOption::Entries(entries) = unsafe { &mut *existing_ptr } {
+            check_read_permission(entries.dir).ok()?;
             if entries.generation < generation {
                 let dir_path = entries.dir;
                 // capture raw ptrs to the in-place `DirEntry` fields, then
@@ -1503,16 +1504,34 @@ impl ModKey {
     }
 }
 
+/// Revalidate paths even when their directory or source contents were cached.
+pub fn check_read_permission(path: &[u8]) -> Result<(), bun_core::Error> {
+    if !bun_permissions::check_path(bun_permissions::Scope::FsRead, path) {
+        return Err(bun_core::err!("AccessDenied"));
+    }
+    Ok(())
+}
+
+fn check_read_file_permission(path: &[u8], file: &bun_sys::File) -> Result<(), bun_core::Error> {
+    check_read_permission(path)?;
+    if !bun_permissions::check_fd(bun_permissions::Scope::FsRead, file.handle()) {
+        return Err(bun_core::err!("AccessDenied"));
+    }
+    Ok(())
+}
+
 impl RealFS {
     pub fn mod_key_with_file(
         &mut self,
         path: &[u8],
         file: &bun_sys::File,
     ) -> Result<ModKey, bun_core::Error> {
+        check_read_file_permission(path, file)?;
         ModKey::generate(self, path, file)
     }
 
     pub fn mod_key(&mut self, path: &[u8]) -> Result<ModKey, bun_core::Error> {
+        check_read_permission(path)?;
         let file = bun_sys::open_file(path, bun_sys::OpenFlags::READ_ONLY)?;
         self.mod_key_with_file(path, &file)
     }
@@ -1540,6 +1559,7 @@ unsafe impl Send for Entry {}
 
 impl RealFS {
     pub fn open_dir(&self, unsafe_dir_string: &[u8]) -> Result<bun_sys::Dir, bun_core::Error> {
+        check_read_permission(unsafe_dir_string)?;
         // On Windows this must go through `open_dir_at_windows_a` with
         // iterable + read_only so the resulting handle has FILE_LIST_DIRECTORY +
         // FILE_DIRECTORY_FILE and can be iterated by `readdir`. The generic
@@ -1577,6 +1597,10 @@ impl RealFS {
         handle: &bun_sys::Dir,
         iterator: I,
     ) -> Result<DirEntry, bun_core::Error> {
+        check_read_permission(dir_)?;
+        if !bun_permissions::check_fd(bun_permissions::Scope::FsRead, handle.fd()) {
+            return Err(bun_core::err!("AccessDenied"));
+        }
         let handle_fd = handle.fd();
         let mut iter = bun_sys::iterate_dir(handle_fd);
         let mut dir = DirEntry::init(dir_, generation);
@@ -1713,6 +1737,12 @@ impl RealFS {
         store_fd: bool,
         iterator: I,
     ) -> Result<*mut EntriesOption, bun_core::Error> {
+        check_read_permission(dir_maybe_trail_slash)?;
+        if let Some(handle) = maybe_handle {
+            if !bun_permissions::check_fd(bun_permissions::Scope::FsRead, handle.fd()) {
+                return Err(bun_core::err!("AccessDenied"));
+            }
+        }
         let dir = strings::paths::without_trailing_slash_windows_path(dir_maybe_trail_slash);
 
         crate::Resolver::assert_valid_cache_key(dir);
@@ -1938,7 +1968,7 @@ pub fn read_file_contents_in_arena(
     path: &[u8],
     arena: &bun_alloc::Arena,
 ) -> Result<(core::ptr::NonNull<u8>, usize), bun_core::Error> {
-    let _ = path;
+    check_read_file_permission(path, file)?;
     FileSystem::set_max_fd(file.handle().native());
 
     let mut initial_buf = [0u8; 16384];
@@ -2054,6 +2084,7 @@ pub fn read_file_with_handle_impl<'p, 'buf, const USE_SHARED_BUFFER: bool, const
     file: &bun_sys::File,
     shared_buffer: &'buf mut MutableString,
 ) -> Result<PathContentsPair<'p, 'buf>, bun_core::Error> {
+    check_read_file_permission(path, file)?;
     // allocator param dropped (global mimalloc)
     FileSystem::set_max_fd(file.handle().native());
 
@@ -2280,6 +2311,7 @@ impl RealFS {
         let mut outpath = PathBuffer::uninit();
         let entry_path =
             path_handler::join_abs_string_buf::<platform::Auto>(self.cwd, &mut outpath[..], &combo);
+        check_read_permission(entry_path)?;
         let entry_path_len = entry_path.len();
 
         outpath[entry_path_len + 1] = 0;

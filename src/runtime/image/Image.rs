@@ -833,6 +833,12 @@ impl Image {
     // layer.
 
     pub fn from_clipboard(global: &JSGlobalObject, _: &CallFrame) -> JsResult<JSValue> {
+        if !bun_permissions::capability_allowed(bun_permissions::Capability::SystemInformation) {
+            use bun_jsc::SysErrorJsc as _;
+            let err = sys::Error::from_code(sys::E::EACCES, sys::Tag::read);
+            return Err(global.throw_value(err.to_js(global)));
+        }
+
         // `codecs::system_backend` is a cfg-gated module re-export.
         #[cfg(any(target_os = "macos", windows))]
         {
@@ -859,7 +865,13 @@ impl Image {
         }
     }
 
-    pub fn has_clipboard_image(_: &JSGlobalObject, _: &CallFrame) -> JsResult<JSValue> {
+    pub fn has_clipboard_image(global: &JSGlobalObject, _: &CallFrame) -> JsResult<JSValue> {
+        if !bun_permissions::capability_allowed(bun_permissions::Capability::SystemInformation) {
+            use bun_jsc::SysErrorJsc as _;
+            let err = sys::Error::from_code(sys::E::EACCES, sys::Tag::read);
+            return Err(global.throw_value(err.to_js(global)));
+        }
+
         #[cfg(any(target_os = "macos", windows))]
         {
             return Ok(JSValue::from(codecs::system_backend::has_clipboard_image()));
@@ -873,7 +885,13 @@ impl Image {
     /// clipboard-change notification, so polling this and calling
     /// `hasClipboardImage()` only when it moves is the cheapest hint-UI
     /// pattern. `-1` on Linux.
-    pub fn clipboard_change_count(_: &JSGlobalObject, _: &CallFrame) -> JsResult<JSValue> {
+    pub fn clipboard_change_count(global: &JSGlobalObject, _: &CallFrame) -> JsResult<JSValue> {
+        if !bun_permissions::capability_allowed(bun_permissions::Capability::SystemInformation) {
+            use bun_jsc::SysErrorJsc as _;
+            let err = sys::Error::from_code(sys::E::EACCES, sys::Tag::read);
+            return Err(global.throw_value(err.to_js(global)));
+        }
+
         #[cfg(any(target_os = "macos", windows))]
         {
             return Ok(JSValue::js_number(
@@ -1263,6 +1281,8 @@ impl<'a> BlobReadChain<'a> {
         };
         // SAFETY: `as_` returned a non-null `*mut Blob` rooted by `blob_js`.
         let blob = unsafe { &mut *blob };
+        crate::webcore::blob::check_blob_permission(blob, bun_permissions::Scope::FsRead, true)
+            .map_err(|err| global.throw_value(err.to_js(global)))?;
 
         // Same Strong-ref contract as the regular pending_tasks bump — keeps
         // the wrapper (and its sourceJS slot) alive until the read settles.
@@ -1497,6 +1517,12 @@ impl<'a> PipelineTask<'a> {
             // SAFETY: `p` borrows `image.source.path`, which outlives the task
             // because `this_ref` is held Strong while pending_tasks > 0.
             let p: &ZStr = unsafe { &*p };
+            if !bun_permissions::check_path(bun_permissions::Scope::FsRead, p.as_bytes()) {
+                self.result = TaskResult::IoErr(
+                    sys::Error::from_code(sys::E::EACCES, sys::Tag::open).with_path(p.as_bytes()),
+                );
+                return;
+            }
             // The path string came straight from the constructor, so treat
             // it as untrusted: open + fstat first instead of `readFrom`.
             //   • !S_ISREG → ENODEV. `/dev/zero`/`/dev/urandom` would

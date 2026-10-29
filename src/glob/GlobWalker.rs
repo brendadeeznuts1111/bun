@@ -58,6 +58,7 @@ pub fn statat_windows(fd: Fd, path: &ZStr) -> Maybe<Stat> {
     let parts: &[&[u8]] = &[&dir[..], path.as_bytes()];
     let mut join_buf = bun_paths::path_buffer_pool::get();
     let statpath = resolve_path::join_z_buf::<platform::Auto>(&mut join_buf[..], parts);
+    check_glob_path(Fd::cwd(), statpath, false)?;
     Syscall::stat(statpath)
 }
 
@@ -154,16 +155,33 @@ impl AccessorDirIter for SyscallDirIter {
     }
 }
 
+fn check_glob_path(directory: Fd, path: &ZStr, entry: bool) -> Maybe<()> {
+    if bun_permissions::check_at_path(
+        bun_permissions::Scope::FsRead,
+        directory,
+        path.as_bytes(),
+        entry,
+    ) {
+        Ok(())
+    } else {
+        Err(SysError::from_code(E::EACCES, bun_sys::Tag::open).with_path(path.as_bytes()))
+    }
+}
+
 impl Accessor for SyscallAccessor {
     const COUNT_FDS: bool = true;
     type Handle = SyscallHandle;
     type DirIter = SyscallDirIter;
 
     fn open(path: &ZStr) -> Result<Maybe<SyscallHandle>, Error> {
+        if let Err(err) = check_glob_path(Fd::cwd(), path, false) {
+            return Ok(Err(err));
+        }
         Ok(Syscall::open(path, O::DIRECTORY | O::RDONLY, 0).map(|fd| SyscallHandle { value: fd }))
     }
 
     fn statat(handle: SyscallHandle, path: &ZStr) -> Maybe<Stat> {
+        check_glob_path(handle.value, path, false)?;
         #[cfg(windows)]
         {
             return statat_windows(handle.value, path);
@@ -174,6 +192,7 @@ impl Accessor for SyscallAccessor {
 
     /// Like statat but does not follow symlinks.
     fn lstatat(handle: SyscallHandle, path: &ZStr) -> Maybe<Stat> {
+        check_glob_path(handle.value, path, true)?;
         #[cfg(windows)]
         {
             return statat_windows(handle.value, path);
@@ -183,6 +202,9 @@ impl Accessor for SyscallAccessor {
     }
 
     fn openat(handle: SyscallHandle, path: &ZStr) -> Result<Maybe<SyscallHandle>, Error> {
+        if let Err(err) = check_glob_path(handle.value, path, false) {
+            return Ok(Err(err));
+        }
         Ok(
             Syscall::openat(handle.value, path, O::DIRECTORY | O::RDONLY, 0)
                 .map(|fd| SyscallHandle { value: fd }),

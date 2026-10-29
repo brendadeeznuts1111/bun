@@ -752,7 +752,8 @@ pub mod fs {
     // Re-exported here so the public path `bun_resolver::fs::*` is preserved.
     pub use crate::fs_full::{
         DifferentCase, DirEntry, DirEntryErr, DirEntryIterator, Entry, EntryCache, EntryKind,
-        EntryKindResolver, EntryLookup, FilenameStoreAppender, FsEntryKind, dir_entry,
+        EntryKindResolver, EntryLookup, FilenameStoreAppender, FsEntryKind, check_read_permission,
+        dir_entry,
     };
 
     use bun_core::Generation;

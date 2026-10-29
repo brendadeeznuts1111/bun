@@ -7,6 +7,7 @@ use bun_http::{Headers, Method};
 use bun_http_types::ETag::StringPointer;
 use bun_io::Closer;
 use bun_io::FileType;
+use bun_jsc::SysErrorJsc as _;
 use bun_resolver::fs::StatHash;
 use bun_sys::{self, Fd};
 use bun_uws::{AnyRequest, AnyResponse};
@@ -146,6 +147,14 @@ impl FileRoute {
             body_value.to_blob_if_possible();
             let needs_read = matches!(body_value, BodyValue::Blob(b) if b.needs_to_read_file());
             if needs_read {
+                if let BodyValue::Blob(blob) = body_value {
+                    crate::webcore::blob::check_blob_permission(
+                        blob,
+                        bun_permissions::Scope::FsRead,
+                        true,
+                    )
+                    .map_err(|err| global.throw_value(err.to_js(global)))?;
+                }
                 // `needs_to_read_file()` ⇒ `store` is Some and `data` is `File`.
                 let is_fd = matches!(
                     body_value,
@@ -339,6 +348,12 @@ impl FileRoute {
             }
         };
         let path: &[u8] = path_buf.as_slice();
+        if !bun_permissions::check_path(bun_permissions::Scope::FsRead, path) {
+            this.write_status_code(403, resp);
+            resp.end_without_body(resp.should_close_connection());
+            Self::on_response_complete(this_ptr, resp);
+            return;
+        }
 
         let open_flags = bun_sys::O::RDONLY | bun_sys::O::CLOEXEC | bun_sys::O::NONBLOCK;
 

@@ -5014,12 +5014,13 @@ pub mod bv2_impl {
             let joined = bun_paths::resolve_path::join_string_buf::<
                 bun_paths::resolve_path::platform::Auto,
             >(&mut buf.0[..], &[outdir, file_path]);
+            crate::output_file::check_output_path(bun_core::Fd::cwd(), joined)?;
             // Create parent directories if needed (relative to outdir).
             let parent = bun_paths::resolve_path::dirname::<bun_paths::resolve_path::platform::Loose>(
                 joined,
             );
             if !parent.is_empty() {
-                let _ = bun_sys::mkdir_recursive(parent);
+                crate::output_file::create_output_directory(bun_core::Fd::cwd(), parent)?;
             }
             let mut zbuf = bun_paths::path_buffer_pool::get();
             let joined_z = bun_paths::resolve_path::z(joined, &mut zbuf);
@@ -5031,6 +5032,7 @@ pub mod bv2_impl {
                         bstr::BStr::new(file_path),
                         err
                     );
+                    return Err(err.into());
                 }
             }
         }

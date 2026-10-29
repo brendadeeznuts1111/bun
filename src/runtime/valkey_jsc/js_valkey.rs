@@ -488,7 +488,12 @@ impl JSValkeyClient {
             arguments[0].to_bun_string(&global_object)?
         } else {
             let env = vm_ref.env_loader();
-            match env.get(b"REDIS_URL").or_else(|| env.get(b"VALKEY_URL")) {
+            let read_url = |key: &[u8]| {
+                bun_permissions::allows(bun_permissions::Scope::Env, key)
+                    .then(|| env.get(key))
+                    .flatten()
+            };
+            match read_url(b"REDIS_URL").or_else(|| read_url(b"VALKEY_URL")) {
                 Some(url) => BunString::borrow_utf8(url),
                 None => BunString::static_(b"valkey://localhost:6379"),
             }

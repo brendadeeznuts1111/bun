@@ -416,6 +416,13 @@ impl WriteFile {
 
     #[cfg(not(windows))]
     fn run_async(&mut self) {
+        if let Err(err) =
+            super::check_blob_permission(&self.file_blob, bun_permissions::Scope::FsWrite, true)
+        {
+            self.system_error = Some(err.to_system_error().into());
+            self.on_finish();
+            return;
+        }
         self.get_fd(Self::run_with_fd);
     }
 
@@ -663,6 +670,17 @@ mod windows_impl {
             on_complete_callback: WriteFileOnWriteFileCallback,
             mkdirp_if_not_exists: bool,
         ) -> Result<*mut WriteFileWindows, WriteFileWindowsError> {
+            if let Err(err) = super::super::check_blob_permission(
+                &file_blob,
+                bun_permissions::Scope::FsWrite,
+                true,
+            ) {
+                on_complete_callback(
+                    on_write_file_context,
+                    WriteFileResultType::Err(Box::new(err.to_system_error().into())),
+                )?;
+                return Err(WriteFileWindowsError::WriteFileWindowsDeinitialized);
+            }
             let mkdirp = mkdirp_if_not_exists
                 && file_blob
                     .store
