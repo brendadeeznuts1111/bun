@@ -35,6 +35,10 @@
     "../src/runtime/bake/client/**.ts"
   ],
   "exclude": [
+    // Intentional syntax errors exercised by regression/issue/14477/14477.test.ts.
+    "./regression/issue/14477/builtin-mismatch.tsx",
+    "./regression/issue/14477/component-mismatch.tsx",
+    "./regression/issue/14477/non-identifier-mismatch.tsx",
     "fixtures",
     "__snapshots__", // bun snapshots (toMatchSnapshot)
     "./snapshots",
